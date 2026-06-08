@@ -2,7 +2,7 @@ import asyncio
 import os
 import logging
 import aiosqlite
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
@@ -14,26 +14,8 @@ from telegram.ext import (
 )
 
 # ============================================================
-# IT Bot Market — Telegram bot for selling IT services
+# ENV CONFIG ONLY
 # ============================================================
-# ALL configuration is read EXCLUSIVELY from environment variables (ENV).
-# Set them in your hosting panel (BotHost Environment Variables):
-#
-#   Required:
-#   BOT_TOKEN          — bot token from @BotFather
-#   ADMIN_ID           — your Telegram ID (number, e.g. 123456789)
-#   CARD_DETAILS       — card details for balance deposits (text)
-#   REVIEWS_CHANNEL    — channel for reviews (e.g. @my_reviews_channel)
-#
-#   Optional (defaults shown):
-#   DB_NAME            — SQLite path (default: it_bot.db)
-#   REFERRAL_PERCENT   — referral bonus % (default: 10)
-#   DEV_PERCENT        — developer cut % (default: 70)
-#   PREPAYMENT_LIMIT   — prepayment threshold (default: 5000)
-#
-#   Dependencies: pip install python-telegram-bot aiosqlite
-# ============================================================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 CARD_DETAILS = os.getenv("CARD_DETAILS")
@@ -42,6 +24,8 @@ DB_NAME = os.getenv("DB_NAME", "it_bot.db")
 REFERRAL_PERCENT = float(os.getenv("REFERRAL_PERCENT", "10"))
 DEV_PERCENT = float(os.getenv("DEV_PERCENT", "70"))
 PREPAYMENT_LIMIT = float(os.getenv("PREPAYMENT_LIMIT", "5000"))
+DEV_PENALTY_PERCENT = float(os.getenv("DEV_PENALTY_PERCENT", "50"))
+DEV_DEADLINE_EXTENSION = int(os.getenv("DEV_DEADLINE_EXTENSION", "3"))
 
 missing = []
 if not BOT_TOKEN:
@@ -83,6 +67,7 @@ async def init_db():
                 referral_code TEXT,
                 referred_by INTEGER,
                 banned INTEGER DEFAULT 0,
+                dev_penalty REAL DEFAULT 0,
                 created_at TEXT
             )
         """)
@@ -95,6 +80,7 @@ async def init_db():
                 description TEXT,
                 price REAL,
                 final_price REAL,
+                deadline_days INTEGER,
                 status TEXT DEFAULT 'new',
                 developer_id INTEGER,
                 temp_bot_username TEXT,
@@ -180,6 +166,16 @@ async def ban_user(tg_id: int, banned: int):
         await db.execute("UPDATE users SET banned = ? WHERE tg_id = ?", (banned, tg_id))
         await db.commit()
 
+async def update_dev_penalty(tg_id: int, amount: float):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET dev_penalty = dev_penalty + ? WHERE tg_id = ?", (amount, tg_id))
+        await db.commit()
+
+async def clear_dev_penalty(tg_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET dev_penalty = 0 WHERE tg_id = ?", (tg_id,))
+        await db.commit()
+
 async def get_all_users():
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
@@ -235,6 +231,13 @@ async def get_orders_by_developer(developer_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM orders WHERE developer_id = ? AND status IN ('in_progress', 'testing', 'revision', 'paid') ORDER BY id DESC", (developer_id,)) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+async def get_available_orders():
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM orders WHERE status IN ('price_set', 'price_negotiation') AND developer_id IS NULL ORDER BY id DESC") as cursor:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
 
@@ -370,6 +373,7 @@ TEXTS = {
         'send_tz': "Опишите подробно функционал бота или пришлите ТЗ (текстом):",
         'order_created': "✅ Заказ #{} создан! Администратор назначит цену в ближайшее время.",
         'price_set': """💰 Стоимость вашего заказа #{}: {} ₽.
+Срок: {} дней.
 {}
 
 Подтвердите заказ:""",
@@ -379,7 +383,8 @@ TEXTS = {
         'suggest_price': "💬 Предложить свою цену",
         'cancel_order': "❌ Отменить",
         'enter_your_price': "Введите сумму, которую вы готовы заплатить (только число):",
-        'price_sent': "💬 Ваша цена отправлена администратору.",
+        'enter_your_deadline': "Введите количество дней на разработку:",
+        'price_sent': "💬 Ваша цена и срок отправлены администратору.",
         'order_cancelled': "❌ Заказ отменен.",
         'not_enough_balance': "❌ Недостаточно средств. Пополните баланс.",
         'prepayment_done': "✅ Предоплата {} ₽ списана. Заказ передан разработчику.",
@@ -392,12 +397,14 @@ TEXTS = {
 🎟 Промокод: {}""",
         'set_price': "💰 Назначить цену",
         'enter_price': "Введите цену для заказа #{} (только число):",
-        'price_updated': "✅ Цена назначена.",
+        'enter_deadline': "Введите срок в днях для заказа #{}:",
+        'price_updated': "✅ Цена и срок назначены.",
         'choose_developer': "Выберите разработчика для заказа #{}:",
         'developer_set': "✅ Разработчик назначен.",
         'developer_assigned': """🔔 Вам назначен заказ #{}!
 📱 {} | 📂 {}
 📝 {}
+Срок: {} дней
 
 Нажмите 'Отправить тестового бота' когда будет готово.""",
         'send_test_bot': "Отправьте юзернейм тестового бота (например, @my_test_bot):",
@@ -461,9 +468,11 @@ https://t.me/{}?start={}
         'enter_promo': """Введите: КОД, ТИП(percent/fixed), ЗНАЧЕНИЕ, МАКС_ИСПОЛЬЗОВАНИЙ
 Пример: SALE10, percent, 10, 50""",
         'promo_created': "✅ Промокод создан.",
-        'enter_promo_code': "Введите промокод или /skip:",
+        'enter_promo_code': "Есть промокод?",
         'promo_applied': "🎟 Промокод применен! Скидка: {} ₽",
         'invalid_promo': "❌ Неверный или недействительный промокод.",
+        'skip_promo': "🚫 Без промокода",
+        'use_promo': "🎟 У меня есть промокод",
         'status_new': "⏳ Ожидает цену",
         'status_price_set': "💰 Цена назначена",
         'status_price_negotiation': "💬 Согласование цены",
@@ -499,6 +508,23 @@ https://t.me/{}?start={}
         'choose_action': "Выберите действие после тестирования:",
         'pay_from_balance': "Списано с баланса: {} ₽",
         'final_price': "Итоговая цена со скидкой: {} ₽",
+        'choose_deadline': "Выберите срок разработки (дней):",
+        'custom_deadline': "✏️ Свой вариант",
+        'deadline_set': "Срок: {} дней",
+        'dev_max_orders': "❌ У вас уже есть активный заказ. Завершите или отмените его перед взятием нового.",
+        'dev_penalty_applied': "⚠️ Штраф 50% ({:.2f} ₽) удержан с разработчика за предыдущий незавершенный заказ.",
+        'dev_cancel_confirm': "❌ Вы уверены, что хотите отменить заказ? С вас будет удержан штраф 50% от следующего выполненного заказа.",
+        'dev_cancelled': "❌ Заказ отменен разработчиком. Штраф начислен.",
+        'list_title': "📋 Доступные заказы:",
+        'list_empty': "Нет доступных заказов.",
+        'take_order': "✅ Взять заказ #{}",
+        'order_taken': "✅ Заказ #{} взят в работу.",
+        'dev_work_panel': "🔨 Ход работы",
+        'dev_extend_deadline': "⏳ Продлить срок (+{} дней)",
+        'deadline_extended': "Срок продлен на {} дней. Новый срок: {} дней.",
+        'dev_cancel_order': "❌ Отменить заказ",
+        'admin_only': "🚫 Только для администраторов.",
+        'dev_only': "🚫 Только для разработчиков.",
     },
     'en': {
         'welcome': """👋 Welcome to IT Bot Market!
@@ -525,6 +551,7 @@ Choose language:""",
         'send_tz': "Describe the bot functionality or send technical task:",
         'order_created': "✅ Order #{} created! Admin will set the price soon.",
         'price_set': """💰 Price for order #{}: {} ₽.
+Deadline: {} days.
 {}
 
 Confirm order:""",
@@ -534,7 +561,8 @@ Confirm order:""",
         'suggest_price': "💬 Suggest price",
         'cancel_order': "❌ Cancel",
         'enter_your_price': "Enter amount you are ready to pay (number only):",
-        'price_sent': "💬 Your price sent to admin.",
+        'enter_your_deadline': "Enter development deadline in days:",
+        'price_sent': "💬 Your price and deadline sent to admin.",
         'order_cancelled': "❌ Order cancelled.",
         'not_enough_balance': "❌ Not enough balance. Please deposit.",
         'prepayment_done': "✅ Prepayment {} ₽ deducted. Order assigned to developer.",
@@ -547,12 +575,14 @@ Confirm order:""",
 🎟 Promo: {}""",
         'set_price': "💰 Set price",
         'enter_price': "Enter price for order #{} (number only):",
-        'price_updated': "✅ Price set.",
+        'enter_deadline': "Enter deadline in days for order #{}:",
+        'price_updated': "✅ Price and deadline set.",
         'choose_developer': "Choose developer for order #{}:",
         'developer_set': "✅ Developer assigned.",
         'developer_assigned': """🔔 New order #{} assigned!
 📱 {} | 📂 {}
 📝 {}
+Deadline: {} days
 
 Press 'Send test bot' when ready.""",
         'send_test_bot': "Send test bot username (e.g., @my_test_bot):",
@@ -616,9 +646,11 @@ Invite friends and get {}% from their orders!""",
         'enter_promo': """Enter: CODE, TYPE(percent/fixed), VALUE, MAX_USES
 Example: SALE10, percent, 10, 50""",
         'promo_created': "✅ Promo code created.",
-        'enter_promo_code': "Enter promo code or /skip:",
+        'enter_promo_code': "Have a promo code?",
         'promo_applied': "🎟 Promo applied! Discount: {} ₽",
         'invalid_promo': "❌ Invalid or expired promo code.",
+        'skip_promo': "🚫 No promo code",
+        'use_promo': "🎟 I have a promo code",
         'status_new': "⏳ Awaiting price",
         'status_price_set': "💰 Price set",
         'status_price_negotiation': "💬 Price negotiation",
@@ -654,6 +686,23 @@ Users: {}""",
         'choose_action': "Choose action after testing:",
         'pay_from_balance': "Deducted from balance: {} ₽",
         'final_price': "Final price with discount: {} ₽",
+        'choose_deadline': "Choose development deadline (days):",
+        'custom_deadline': "✏️ Custom",
+        'deadline_set': "Deadline: {} days",
+        'dev_max_orders': "❌ You already have an active order. Complete or cancel it before taking a new one.",
+        'dev_penalty_applied': "⚠️ Penalty 50% ({:.2f} ₽) deducted from developer for previous uncompleted order.",
+        'dev_cancel_confirm': "❌ Are you sure you want to cancel? A 50% penalty from your next completed order will apply.",
+        'dev_cancelled': "❌ Order cancelled by developer. Penalty applied.",
+        'list_title': "📋 Available orders:",
+        'list_empty': "No available orders.",
+        'take_order': "✅ Take order #{}",
+        'order_taken': "✅ Order #{} taken.",
+        'dev_work_panel': "🔨 Work progress",
+        'dev_extend_deadline': "⏳ Extend deadline (+{} days)",
+        'deadline_extended': "Deadline extended by {} days. New deadline: {} days.",
+        'dev_cancel_order': "❌ Cancel order",
+        'admin_only': "🚫 Admin only.",
+        'dev_only': "🚫 Developer only.",
     }
 }
 
@@ -684,7 +733,76 @@ async def main_menu_keyboard(tg_id: int):
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
-# ==================== HANDLERS ====================
+# ==================== COMMANDS ====================
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    if tg_id != ADMIN_ID:
+        await update.message.reply_text(await get_text(tg_id, 'admin_only'))
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Orders", callback_data="admin_orders")],
+        [InlineKeyboardButton("💰 Deposits", callback_data="admin_deposits")],
+        [InlineKeyboardButton("🏦 Withdrawals", callback_data="admin_withdrawals")],
+        [InlineKeyboardButton("👥 Staff management", callback_data="admin_staff")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🎟 Promo codes", callback_data="admin_promos")],
+    ])
+    await update.message.reply_text("Admin panel", reply_markup=kb)
+
+async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    user = await get_user(tg_id)
+    if not user or user['role'] not in ('developer', 'admin'):
+        await update.message.reply_text(await get_text(tg_id, 'dev_only'))
+        return
+
+    # Check if dev has active order
+    active_orders = await get_orders_by_developer(tg_id)
+    if active_orders:
+        # Show work panel for active order
+        order = active_orders[0]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(await get_text(tg_id, 'send_test_bot_btn'), callback_data=f"dev_sendbot_{order['id']}")],
+            [InlineKeyboardButton(await get_text(tg_id, 'dev_extend_deadline').format(DEV_DEADLINE_EXTENSION), callback_data=f"dev_extend_{order['id']}")],
+            [InlineKeyboardButton(await get_text(tg_id, 'dev_cancel_order'), callback_data=f"dev_cancelconfirm_{order['id']}")],
+        ])
+        await update.message.reply_text(
+            f"Order #{order['id']}\n{order['platform']} | {order['topic']}\nDeadline: {order['deadline_days']} days\n{order['description']}",
+            reply_markup=kb
+        )
+    else:
+        await update.message.reply_text("No active orders. Use /list to find available orders.")
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    user = await get_user(tg_id)
+    if not user or user['role'] not in ('developer', 'admin'):
+        await update.message.reply_text(await get_text(tg_id, 'dev_only'))
+        return
+
+    # Check if developer already has active order (not admin)
+    if user['role'] == 'developer':
+        active_orders = await get_orders_by_developer(tg_id)
+        if active_orders:
+            await update.message.reply_text(await get_text(tg_id, 'dev_max_orders'))
+            return
+
+    orders = await get_available_orders()
+    if not orders:
+        await update.message.reply_text(await get_text(tg_id, 'list_empty'))
+        return
+
+    await update.message.reply_text(await get_text(tg_id, 'list_title'))
+    for o in orders:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(await get_text(tg_id, 'take_order', o['id']), callback_data=f"list_take_{o['id']}")]
+        ])
+        await update.message.reply_text(
+            f"Order #{o['id']}\nPlatform: {o['platform']}\nTopic: {o['topic']}\nPrice: {o['price']} ₽\nDeadline: {o['deadline_days']} days\n{o['description'][:100]}...",
+            reply_markup=kb
+        )
+
+# ==================== START & LANGUAGE ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     username = update.effective_user.username or "no_username"
@@ -713,6 +831,8 @@ async def set_language_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(await get_text(tg_id, 'language_set'))
     await context.bot.send_message(chat_id=tg_id, text=await get_text(tg_id, 'menu'), reply_markup=await main_menu_keyboard(tg_id))
 
+
+# ==================== TEXT HANDLER ====================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     text = update.message.text
@@ -730,17 +850,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == 'order_desc':
         context.user_data['description'] = text
         context.user_data['state'] = 'order_promo'
-        await update.message.reply_text(await get_text(tg_id, 'enter_promo_code'))
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t['use_promo'], callback_data="promo_yes")],
+            [InlineKeyboardButton(t['skip_promo'], callback_data="promo_no")]
+        ])
+        await update.message.reply_text(await get_text(tg_id, 'enter_promo_code'), reply_markup=kb)
         return
-    elif state == 'order_promo':
+    elif state == 'order_promo_input':
         promo_code = None
-        if text.strip() != '/skip':
+        if text.strip():
             promo = await get_promo_code(text.strip())
             if promo and promo['uses_count'] < promo['max_uses']:
                 promo_code = text.strip().upper()
                 await update.message.reply_text(await get_text(tg_id, 'promo_applied', promo['value']))
             else:
                 await update.message.reply_text(await get_text(tg_id, 'invalid_promo'))
+                return
         order_id = await create_order(tg_id, context.user_data['platform'], context.user_data['topic'], context.user_data['description'], promo_code)
         user_data = await get_user(tg_id)
         await context.bot.send_message(
@@ -762,8 +887,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("Enter a number.")
             return
+        context.user_data['temp_price'] = price
+        context.user_data['state'] = 'enter_deadline'
         order_id = context.user_data['admin_order_id']
-        await update_order(order_id, price=price, status='price_set')
+        await update.message.reply_text(await get_text(tg_id, 'enter_deadline', order_id))
+        return
+    elif state == 'enter_deadline':
+        try:
+            days = int(text.strip())
+        except ValueError:
+            await update.message.reply_text("Enter a whole number.")
+            return
+        order_id = context.user_data['admin_order_id']
+        price = context.user_data['temp_price']
+        await update_order(order_id, price=price, deadline_days=days, status='price_set')
         order = await get_order(order_id)
         prepayment_text = await get_text(order['user_id'], 'prepayment_required', price) if price < PREPAYMENT_LIMIT else await get_text(order['user_id'], 'no_prepayment')
         kb = InlineKeyboardMarkup([
@@ -773,11 +910,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await context.bot.send_message(
             chat_id=order['user_id'],
-            text=await get_text(order['user_id'], 'price_set', order_id, price, prepayment_text),
+            text=await get_text(order['user_id'], 'price_set', order_id, price, days, prepayment_text),
             reply_markup=kb
         )
         context.user_data.pop('state', None)
         context.user_data.pop('admin_order_id', None)
+        context.user_data.pop('temp_price', None)
         await update.message.reply_text(await get_text(tg_id, 'price_updated'))
         return
     elif state == 'user_suggest_price':
@@ -786,18 +924,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("Enter a number.")
             return
+        context.user_data['temp_negoprice'] = price
+        context.user_data['state'] = 'user_suggest_deadline'
+        await update.message.reply_text(await get_text(tg_id, 'enter_your_deadline'))
+        return
+    elif state == 'user_suggest_deadline':
+        try:
+            days = int(text.strip())
+        except ValueError:
+            await update.message.reply_text("Enter a whole number.")
+            return
         order_id = context.user_data['suggest_order_id']
+        price = context.user_data['temp_negoprice']
         await update_order(order_id, status='price_negotiation')
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=f"Client suggested price {price} RUB for order #{order_id}.",
+            text=f"Client suggested price {price} RUB, deadline {days} days for order #{order_id}.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Accept price", callback_data=f"admin_acceptnegoprice_{order_id}_{price}")],
+                [InlineKeyboardButton("Accept", callback_data=f"admin_acceptnegoprice_{order_id}_{price}_{days}")],
                 [InlineKeyboardButton("Reject", callback_data=f"admin_rejectnegoprice_{order_id}")]
             ])
         )
         context.user_data.pop('state', None)
         context.user_data.pop('suggest_order_id', None)
+        context.user_data.pop('temp_negoprice', None)
         await update.message.reply_text(await get_text(tg_id, 'price_sent'))
         return
     elif state == 'dev_send_bot':
@@ -995,33 +1145,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(await get_text(tg_id, 'choose_language'), reply_markup=kb)
     elif text == t['admin_panel']:
         if tg_id == ADMIN_ID:
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("📦 Orders", callback_data="admin_orders")],
-                [InlineKeyboardButton("💰 Deposits", callback_data="admin_deposits")],
-                [InlineKeyboardButton("🏦 Withdrawals", callback_data="admin_withdrawals")],
-                [InlineKeyboardButton("👥 Staff management", callback_data="admin_staff")],
-                [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
-                [InlineKeyboardButton("🎟 Promo codes", callback_data="admin_promos")],
-            ])
-            await update.message.reply_text("Admin panel", reply_markup=kb)
+            await cmd_admin(update, context)
     elif text == t['developer_panel']:
         if user['role'] in ('developer', 'admin'):
-            orders = await get_orders_by_developer(tg_id)
-            if not orders:
-                await update.message.reply_text("No active orders.")
-                return
-            for o in orders:
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton(t['send_test_bot_btn'], callback_data=f"dev_sendbot_{o['id']}")]
-                ])
-                await update.message.reply_text(
-                    f"Order #{o['id']}\n{o['platform']} | {o['topic']}\n{o['description']}",
-                    reply_markup=kb
-                )
+            await cmd_dev(update, context)
     else:
         await update.message.reply_text(await get_text(tg_id, 'menu'), reply_markup=await main_menu_keyboard(tg_id))
 
 
+# ==================== CALLBACK HANDLER ====================
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1049,6 +1181,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['topic'] = topic
         context.user_data['state'] = 'order_desc'
         await query.edit_message_text(await get_text(tg_id, 'send_tz'))
+    elif data == "promo_yes":
+        context.user_data['state'] = 'order_promo_input'
+        await query.edit_message_text("Enter promo code:")
+    elif data == "promo_no":
+        order_id = await create_order(tg_id, context.user_data['platform'], context.user_data['topic'], context.user_data['description'], None)
+        user_data = await get_user(tg_id)
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=await get_text(ADMIN_ID, 'new_order_admin', order_id, user_data['username'] or "N/A", tg_id, context.user_data['platform'], context.user_data['topic'], context.user_data['description'], "-"),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(await get_text(ADMIN_ID, 'set_price'), callback_data=f"admin_setprice_{order_id}")]
+            ])
+        )
+        context.user_data.pop('state', None)
+        context.user_data.pop('platform', None)
+        context.user_data.pop('topic', None)
+        context.user_data.pop('description', None)
+        await query.edit_message_text(await get_text(tg_id, 'order_created', order_id))
+        await context.bot.send_message(chat_id=tg_id, text=await get_text(tg_id, 'menu'), reply_markup=await main_menu_keyboard(tg_id))
     elif data.startswith("setlang_"):
         lang = data.split('_')[1]
         await update_user_language(tg_id, lang)
@@ -1074,9 +1225,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update_order(order_id, status='in_progress')
             await query.edit_message_text(await get_text(tg_id, 'order_confirmed'))
+        # Notify admin or dev
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=f"Order #{order_id} confirmed by client. Assign a developer.",
+            text=f"Order #{order_id} confirmed by client. Assign a developer or use /list.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Assign developer", callback_data=f"admin_assigndev_{order_id}")]
             ])
@@ -1094,7 +1246,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split('_')
         order_id = int(parts[2])
         price = float(parts[3])
-        await update_order(order_id, price=price, status='price_set')
+        days = int(parts[4])
+        await update_order(order_id, price=price, deadline_days=days, status='price_set')
         order = await get_order(order_id)
         prepayment_text = await get_text(order['user_id'], 'prepayment_required', price) if price < PREPAYMENT_LIMIT else await get_text(order['user_id'], 'no_prepayment')
         kb = InlineKeyboardMarkup([
@@ -1103,10 +1256,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await context.bot.send_message(
             chat_id=order['user_id'],
-            text=await get_text(order['user_id'], 'price_set', order_id, price, prepayment_text),
+            text=await get_text(order['user_id'], 'price_set', order_id, price, days, prepayment_text),
             reply_markup=kb
         )
-        await query.edit_message_text("Price updated and sent to client.")
+        await query.edit_message_text("Price and deadline updated and sent to client.")
     elif data.startswith("admin_rejectnegoprice_"):
         order_id = int(data.split('_')[2])
         await query.edit_message_text(f"Order #{order_id}: price rejected. Waiting for admin price.")
@@ -1128,7 +1281,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order = await get_order(order_id)
         await context.bot.send_message(
             chat_id=dev_id,
-            text=await get_text(dev_id, 'developer_assigned', order_id, order['platform'], order['topic'], order['description']),
+            text=await get_text(dev_id, 'developer_assigned', order_id, order['platform'], order['topic'], order['description'], order['deadline_days']),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(await get_text(dev_id, 'send_test_bot_btn'), callback_data=f"dev_sendbot_{order_id}")]
             ])
@@ -1187,6 +1340,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_balance(int(user_data['referred_by']), bonus)
         if order['developer_id']:
             dev_bonus = final_price * (DEV_PERCENT / 100)
+            # Apply penalty if exists
+            dev_user = await get_user(order['developer_id'])
+            if dev_user and dev_user['dev_penalty'] > 0:
+                penalty = min(dev_bonus, dev_user['dev_penalty'])
+                dev_bonus -= penalty
+                await update_dev_penalty(order['developer_id'], -penalty)
+                await context.bot.send_message(
+                    chat_id=order['developer_id'],
+                    text=await get_text(order['developer_id'], 'dev_penalty_applied', penalty)
+                )
             await update_balance(order['developer_id'], dev_bonus)
 
         await query.edit_message_text(await get_text(tg_id, 'order_paid'))
@@ -1325,6 +1488,74 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_promos":
         context.user_data['state'] = 'admin_promo'
         await query.edit_message_text(await get_text(tg_id, 'enter_promo'))
+    elif data.startswith("list_take_"):
+        order_id = int(data.split('_')[2])
+        order = await get_order(order_id)
+        if not order or order['developer_id']:
+            await query.edit_message_text("Order already taken.")
+            return
+        # Check if dev has active order
+        if user['role'] == 'developer':
+            active = await get_orders_by_developer(tg_id)
+            if active:
+                await query.edit_message_text(await get_text(tg_id, 'dev_max_orders'))
+                return
+        await update_order(order_id, developer_id=tg_id, status='in_progress')
+        await query.edit_message_text(await get_text(tg_id, 'order_taken', order_id))
+        await context.bot.send_message(
+            chat_id=order['user_id'],
+            text=f"🔔 Developer assigned to your order #{order_id}. Development started."
+        )
+    elif data.startswith("dev_extend_"):
+        order_id = int(data.split('_')[2])
+        order = await get_order(order_id)
+        if not order or order['developer_id'] != tg_id:
+            await query.edit_message_text("Not your order.")
+            return
+        new_days = (order['deadline_days'] or 0) + DEV_DEADLINE_EXTENSION
+        await update_order(order_id, deadline_days=new_days)
+        await query.edit_message_text(await get_text(tg_id, 'deadline_extended', DEV_DEADLINE_EXTENSION, new_days))
+        await context.bot.send_message(
+            chat_id=order['user_id'],
+            text=f"📅 Deadline for order #{order_id} extended by {DEV_DEADLINE_EXTENSION} days. New deadline: {new_days} days."
+        )
+    elif data.startswith("dev_cancelconfirm_"):
+        order_id = int(data.split('_')[2])
+        order = await get_order(order_id)
+        if not order or order['developer_id'] != tg_id:
+            await query.edit_message_text("Not your order.")
+            return
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes, cancel", callback_data=f"dev_cancel_{order_id}")],
+            [InlineKeyboardButton("🔙 Back", callback_data=f"dev_back_{order_id}")]
+        ])
+        await query.edit_message_text(await get_text(tg_id, 'dev_cancel_confirm'), reply_markup=kb)
+    elif data.startswith("dev_cancel_"):
+        order_id = int(data.split('_')[2])
+        order = await get_order(order_id)
+        if not order or order['developer_id'] != tg_id:
+            await query.edit_message_text("Not your order.")
+            return
+        # Apply penalty
+        penalty_amount = (order['price'] or 0) * (DEV_PENALTY_PERCENT / 100)
+        await update_dev_penalty(tg_id, penalty_amount)
+        await update_order(order_id, developer_id=None, status='price_set')
+        await query.edit_message_text(await get_text(tg_id, 'dev_cancelled'))
+        # Refund client if prepayment was made
+        if order['price'] and order['price'] < PREPAYMENT_LIMIT:
+            await update_balance(order['user_id'], order['price'])
+            await context.bot.send_message(
+                chat_id=order['user_id'],
+                text=f"❌ Order #{order_id} cancelled by developer. Prepayment {order['price']} ₽ refunded to your balance."
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=order['user_id'],
+                text=f"❌ Order #{order_id} cancelled by developer. No prepayment was required."
+            )
+    elif data.startswith("dev_back_"):
+        order_id = int(data.split('_')[2])
+        await query.edit_message_text("Cancelled.")
     else:
         await query.edit_message_text("Unknown command.")
 
@@ -1389,7 +1620,6 @@ async def post_init(application: Application):
     await init_db()
 
 def main():
-    # Build application with post_init hook
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -1397,15 +1627,22 @@ def main():
         .build()
     )
 
+    # Commands
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin", cmd_admin))
+    application.add_handler(CommandHandler("dev", cmd_dev))
+    application.add_handler(CommandHandler("list", cmd_list))
+
+    # Callbacks
     application.add_handler(CallbackQueryHandler(set_language_callback, pattern="^lang_"))
     application.add_handler(CallbackQueryHandler(handle_callback))
+
+    # Messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ZIP, handle_document))
 
-    # run_polling() is a BLOCKING method that handles its own event loop
-    # Do NOT use asyncio.run() or await with it
+    # Run polling (blocking, synchronous)
     application.run_polling()
 
 if __name__ == "__main__":
