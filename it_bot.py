@@ -2,7 +2,7 @@ import asyncio
 import os
 import logging
 import aiosqlite
-from datetime import datetime, timedelta
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
@@ -13,14 +13,12 @@ from telegram.ext import (
     filters,
 )
 
-# ============================================================
-# ENV CONFIG ONLY
-# ============================================================
+# ==================== CONFIG ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
 CARD_DETAILS = os.getenv("CARD_DETAILS")
 REVIEWS_CHANNEL = os.getenv("REVIEWS_CHANNEL")
-DB_NAME = os.getenv("DB_NAME", "it_bot.db")
+DB_NAME = os.path.join(os.getenv("DATA_DIR", "/app/data"), os.getenv("DB_NAME", "it_bot.db"))
 REFERRAL_PERCENT = float(os.getenv("REFERRAL_PERCENT", "10"))
 DEV_PERCENT = float(os.getenv("DEV_PERCENT", "70"))
 PREPAYMENT_LIMIT = float(os.getenv("PREPAYMENT_LIMIT", "5000"))
@@ -28,30 +26,26 @@ DEV_PENALTY_PERCENT = float(os.getenv("DEV_PENALTY_PERCENT", "50"))
 DEV_DEADLINE_EXTENSION = int(os.getenv("DEV_DEADLINE_EXTENSION", "3"))
 
 missing = []
-if not BOT_TOKEN:
-    missing.append("BOT_TOKEN")
-if not ADMIN_ID:
-    missing.append("ADMIN_ID")
-if not CARD_DETAILS:
-    missing.append("CARD_DETAILS")
-if not REVIEWS_CHANNEL:
-    missing.append("REVIEWS_CHANNEL")
+if not BOT_TOKEN: missing.append("BOT_TOKEN")
+if not ADMIN_ID: missing.append("ADMIN_ID")
+if not CARD_DETAILS: missing.append("CARD_DETAILS")
+if not REVIEWS_CHANNEL: missing.append("REVIEWS_CHANNEL")
 
 if missing:
-    raise EnvironmentError(
-        f"[CONFIG ERROR] Missing required environment variables: {', '.join(missing)}. "
-        f"Set them in your hosting panel before starting."
-    )
+    raise EnvironmentError(f"[CONFIG ERROR] Missing: {', '.join(missing)}")
 
 try:
     ADMIN_ID = int(ADMIN_ID)
 except ValueError:
-    raise EnvironmentError("[CONFIG ERROR] ADMIN_ID must be an integer (Telegram ID).")
+    raise EnvironmentError("[CONFIG ERROR] ADMIN_ID must be integer")
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ==================== CLEAR STATE ====================
+def clear_state(context: ContextTypes.DEFAULT_TYPE):
+    for key in list(context.user_data.keys()):
+        del context.user_data[key]
 
 # ==================== DATABASE ====================
 async def init_db():
@@ -133,6 +127,7 @@ async def init_db():
             )
         """)
         await db.commit()
+        logger.info("Database initialized at %s", DB_NAME)
 
 async def get_user(tg_id: int):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -150,6 +145,7 @@ async def create_user(tg_id: int, username: str, referred_by: str = None):
             (tg_id, username, ref_code, referred_by, now)
         )
         await db.commit()
+        logger.info("User created: %s", tg_id)
 
 async def update_user_language(tg_id: int, language: str):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -164,16 +160,6 @@ async def update_user_role(tg_id: int, role: str):
 async def ban_user(tg_id: int, banned: int):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("UPDATE users SET banned = ? WHERE tg_id = ?", (banned, tg_id))
-        await db.commit()
-
-async def update_dev_penalty(tg_id: int, amount: float):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET dev_penalty = dev_penalty + ? WHERE tg_id = ?", (amount, tg_id))
-        await db.commit()
-
-async def clear_dev_penalty(tg_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET dev_penalty = 0 WHERE tg_id = ?", (tg_id,))
         await db.commit()
 
 async def get_all_users():
@@ -194,6 +180,7 @@ async def update_balance(tg_id: int, amount: float):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("UPDATE users SET balance = balance + ? WHERE tg_id = ?", (amount, tg_id))
         await db.commit()
+        logger.info("Balance updated for %s: %s", tg_id, amount)
 
 async def get_balance(tg_id: int) -> float:
     user = await get_user(tg_id)
@@ -211,6 +198,7 @@ async def create_order(user_id: int, platform: str, topic: str, description: str
             (user_id, platform, topic, description, promo_code, now, now)
         )
         await db.commit()
+        logger.info("Order created: %s", cursor.lastrowid)
         return cursor.lastrowid
 
 async def get_order(order_id: int):
@@ -237,7 +225,7 @@ async def get_orders_by_developer(developer_id: int):
 async def get_available_orders():
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM orders WHERE status IN ('price_set', 'price_negotiation') AND developer_id IS NULL ORDER BY id DESC") as cursor:
+        async with db.execute("SELECT * FROM orders WHERE status IN ('price_set', 'price_negotiation', 'waiting_prepayment') AND developer_id IS NULL ORDER BY id DESC") as cursor:
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
 
@@ -256,6 +244,7 @@ async def update_order(order_id: int, **kwargs):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(f"UPDATE orders SET {fields} WHERE id = ?", values)
         await db.commit()
+        logger.info("Order %s updated: %s", order_id, kwargs)
 
 async def create_balance_request(user_id: int, amount: float, screenshot_file_id: str):
     now = datetime.now().isoformat()
@@ -345,16 +334,25 @@ async def create_review(order_id: int, user_id: int, rating: int, text: str):
         )
         await db.commit()
 
+async def update_dev_penalty(tg_id: int, amount: float):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET dev_penalty = dev_penalty + ? WHERE tg_id = ?", (amount, tg_id))
+        await db.commit()
 
-# ==================== LOCALIZATION ====================
+async def clear_dev_penalty(tg_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET dev_penalty = 0 WHERE tg_id = ?", (tg_id,))
+        await db.commit()
+
+
+# ==================== LOCALIZATION (FULL RUSSIAN) ====================
 TEXTS = {
     'ru': {
-        'welcome': """👋 Добро пожаловать в IT Bot Market!
-Выберите язык:""",
-        'menu': """📋 Главное меню. Выберите действие:""",
+        'welcome': "👋 Добро пожаловать в IT Bot Market!\nВыберите язык:",
+        'menu': "📋 Главное меню",
         'new_order': "🛒 Создать заказ",
         'my_orders': "📦 Мои заказы",
-        'balance': "💰 Баланс: {:.2f} ₽",
+        'balance': "💰 Баланс",
         'deposit': "💳 Пополнить баланс",
         'withdraw': "🏦 Вывести средства",
         'referral': "👥 Реферальная программа",
@@ -372,12 +370,8 @@ TEXTS = {
         'other': "📝 Другое",
         'send_tz': "Опишите подробно функционал бота или пришлите ТЗ (текстом):",
         'order_created': "✅ Заказ #{} создан! Администратор назначит цену в ближайшее время.",
-        'price_set': """💰 Стоимость вашего заказа #{}: {} ₽.
-Срок: {} дней.
-{}
-
-Подтвердите заказ:""",
-        'prepayment_required': "⚠️ Требуется предоплата 100% ({} ₽), так как сумма < 5000 ₽. Средства будут списаны с вашего баланса.",
+        'price_set': "💰 Стоимость заказа #{}: {} ₽\nСрок: {} дней\n{}\n\nПодтвердите заказ:",
+        'prepayment_required': "⚠️ Требуется предоплата 100% ({} ₽), так как сумма < {} ₽. Средства будут списаны с вашего баланса.",
         'no_prepayment': "✅ Предоплата не требуется. Оплата после тестирования.",
         'accept_price': "✅ Согласен",
         'suggest_price': "💬 Предложить свою цену",
@@ -389,29 +383,16 @@ TEXTS = {
         'not_enough_balance': "❌ Недостаточно средств. Пополните баланс.",
         'prepayment_done': "✅ Предоплата {} ₽ списана. Заказ передан разработчику.",
         'order_confirmed': "✅ Заказ подтвержден. Ожидайте начала разработки.",
-        'new_order_admin': """🆕 Новый заказ #{}.
-👤 Клиент: @{}/{}
-📱 Платформа: {}
-📂 Тематика: {}
-📝 Описание: {}
-🎟 Промокод: {}""",
-        'set_price': "💰 Назначить цену",
+        'new_order_admin': "🆕 Новый заказ #{}\n👤 Клиент: @{}/{}\n📱 Платформа: {}\n📂 Тематика: {}\n📝 Описание: {}\n🎟 Промокод: {}",
+        'set_price': "💰 Назначить цену и срок",
         'enter_price': "Введите цену для заказа #{} (только число):",
         'enter_deadline': "Введите срок в днях для заказа #{}:",
         'price_updated': "✅ Цена и срок назначены.",
         'choose_developer': "Выберите разработчика для заказа #{}:",
         'developer_set': "✅ Разработчик назначен.",
-        'developer_assigned': """🔔 Вам назначен заказ #{}!
-📱 {} | 📂 {}
-📝 {}
-Срок: {} дней
-
-Нажмите 'Отправить тестового бота' когда будет готово.""",
+        'developer_assigned': "🔔 Вам назначен заказ #{}!\n📱 {} | 📂 {}\n📝 {}\nСрок: {} дней\n\nНажмите 'Отправить тестового бота' когда будет готово.",
         'send_test_bot': "Отправьте юзернейм тестового бота (например, @my_test_bot):",
-        'test_bot_sent': """🤖 Ваш бот готов!
-Перейдите для теста: {}
-
-После проверки нажмите 'Далее'.""",
+        'test_bot_sent': "🤖 Ваш бот готов!\nПерейдите для теста: {}\n\nПосле проверки нажмите 'Далее'.",
         'test_bot_received': "✅ Тестовый бот получен. Клиент уведомлен.",
         'next': "➡️ Далее",
         'pay': "💰 Оплатить",
@@ -422,7 +403,7 @@ TEXTS = {
         'max_revisions': "❌ Лимит правок исчерпан (3/3). Дальнейшие правки технически невозможны.",
         'order_paid': "✅ Заказ оплачен! Администратор подготовит исходный код.",
         'order_refused': "🚫 Заказ отменен. {}",
-        'prepayment_kept': "Предоплата {} ₽ остается у магазина (сумма < 5000 ₽).",
+        'prepayment_kept': "Предоплата {} ₽ остается у магазина (сумма < {} ₽).",
         'no_prepayment_return': "Предоплата не требовалась.",
         'send_zip_admin': "📦 Заказ #{} оплачен. Пришлите ZIP-файл с исходным кодом (ответом на это сообщение):",
         'zip_sent': "📦 Исходный код получен! Спасибо за заказ.",
@@ -430,28 +411,13 @@ TEXTS = {
         'review_text': "Напишите текст отзыва:",
         'review_thanks': "Спасибо за отзыв!",
         'enter_deposit': "Введите сумму для пополнения (₽):",
-        'deposit_info': """Переведите {} ₽ на карту:
-{}
-
-В комментарии обязательно укажите: пополнение {}
-
-После перевода пришлите скриншот:""",
+        'deposit_info': "Переведите {} ₽ на карту:\n{}\n\nВ комментарии укажите: пополнение {}\n\nПосле перевода пришлите скриншот:",
         'deposit_sent': "⏳ Заявка на пополнение отправлена. Ожидайте подтверждения.",
-        'enter_withdraw': """Введите сумму, ФИО и номер карты через запятую:
-(Пример: 5000, Иванов И.И., 4276123456789012)""",
+        'enter_withdraw': "Введите сумму, ФИО и номер карты через запятую:\n(Пример: 5000, Иванов И.И., 4276123456789012)",
         'withdraw_sent': "⏳ Заявка на вывод отправлена.",
-        'referral_text': """👥 Ваша реферальная ссылка:
-https://t.me/{}?start={}
-
-Приглашайте друзей и получайте {}% с их заказов на баланс!""",
-        'new_balance_req': """💰 Заявка на пополнение #{}
-👤 @{}/{}
-💵 {} ₽""",
-        'new_withdrawal': """🏦 Заявка на вывод #{}
-👤 @{}/{}
-💵 {} ₽
-👤 ФИО: {}
-💳 Карта: {}""",
+        'referral_text': "👥 Ваша реферальная ссылка:\nhttps://t.me/{}?start={}\n\nПриглашайте друзей и получайте {}% с их заказов на баланс!",
+        'new_balance_req': "💰 Заявка на пополнение #{}\n👤 @{}/{}\n💵 {} ₽",
+        'new_withdrawal': "🏦 Заявка на вывод #{}\n👤 @{}/{}\n💵 {} ₽\n👤 ФИО: {}\n💳 Карта: {}",
         'confirm': "✅ Подтвердить",
         'reject': "❌ Отклонить",
         'balance_confirmed': "✅ Баланс пополнен на {} ₽",
@@ -465,8 +431,7 @@ https://t.me/{}?start={}
         'dev_removed': "✅ Пользователь снят с должности разработчика.",
         'enter_broadcast': "Введите текст для рассылки всем пользователям:",
         'broadcast_done': "✅ Рассылка завершена. Доставлено: {}",
-        'enter_promo': """Введите: КОД, ТИП(percent/fixed), ЗНАЧЕНИЕ, МАКС_ИСПОЛЬЗОВАНИЙ
-Пример: SALE10, percent, 10, 50""",
+        'enter_promo': "Введите: КОД, ТИП(percent/fixed), ЗНАЧЕНИЕ, МАКС_ИСПОЛЬЗОВАНИЙ\nПример: SALE10, percent, 10, 50",
         'promo_created': "✅ Промокод создан.",
         'enter_promo_code': "Есть промокод?",
         'promo_applied': "🎟 Промокод применен! Скидка: {} ₽",
@@ -485,11 +450,7 @@ https://t.me/{}?start={}
         'status_reviewed': "⭐ Завершен",
         'status_cancelled': "❌ Отменен",
         'no_orders': "У вас пока нет заказов.",
-        'order_info': """📦 Заказ #{}
-📊 Статус: {}
-💰 Цена: {} ₽
-📱 {} | 📂 {}
-📝 {}""",
+        'order_info': "📦 Заказ #{}\n📊 Статус: {}\n💰 Цена: {} ₽\n📱 {} | 📂 {}\n📝 {}",
         'order_list': "📦 Заказ #{} — {}",
         'banned': "🚫 Вы забанены.",
         'back': "🔙 Назад",
@@ -497,10 +458,7 @@ https://t.me/{}?start={}
         'choose_language': "🌐 Выберите язык:",
         'language_set': "✅ Язык изменен.",
         'my_balance': "💰 Ваш баланс: {:.2f} ₽",
-        'admin_stats': """📊 Статистика
-Всего заказов: {}
-Активных: {}
-Пользователей: {}""",
+        'admin_stats': "📊 Статистика\nВсего заказов: {}\nАктивных: {}\nПользователей: {}",
         'send_test_bot_btn': "🤖 Отправить тестового бота",
         'send_zip_btn': "📦 Отправить ZIP клиенту",
         'no_developers': "Нет доступных разработчиков.",
@@ -525,14 +483,31 @@ https://t.me/{}?start={}
         'dev_cancel_order': "❌ Отменить заказ",
         'admin_only': "🚫 Только для администраторов.",
         'dev_only': "🚫 Только для разработчиков.",
+        'cancel': "❌ Отмена",
+        'back_to_menu': "🔙 Вернуться в меню",
+        'enter_custom_deadline': "Введите количество дней (число):",
+        'choose_deadline_buttons': "Выберите срок:",
+        'day': "{} дней",
+        'admin_menu_title': "🔧 Админ-панель\n\nВыберите раздел:",
+        'admin_orders_btn': "📦 Заказы",
+        'admin_deposits_btn': "💰 Пополнения",
+        'admin_withdrawals_btn': "🏦 Выводы",
+        'admin_staff_btn': "👥 Управление персоналом",
+        'admin_broadcast_btn': "📢 Рассылка",
+        'admin_promos_btn': "🎟 Промокоды",
+        'staff_setdev': "Назначить разработчика",
+        'staff_removedev': "Снять разработчика",
+        'staff_ban': "Забанить",
+        'staff_unban': "Разбанить",
+        'staff_back': "🔙 Назад",
+        'order_details': "📦 Заказ #{}\n👤 Клиент: {}\n📱 {} | 📂 {}\n💰 {} ₽ | Срок: {} дней\n📝 {}",
     },
     'en': {
-        'welcome': """👋 Welcome to IT Bot Market!
-Choose language:""",
-        'menu': """📋 Main menu:""",
+        'welcome': "👋 Welcome to IT Bot Market!\nChoose language:",
+        'menu': "📋 Main menu",
         'new_order': "🛒 New order",
         'my_orders': "📦 My orders",
-        'balance': "💰 Balance: {:.2f} ₽",
+        'balance': "💰 Balance",
         'deposit': "💳 Deposit",
         'withdraw': "🏦 Withdraw",
         'referral': "👥 Referral program",
@@ -550,12 +525,8 @@ Choose language:""",
         'other': "📝 Other",
         'send_tz': "Describe the bot functionality or send technical task:",
         'order_created': "✅ Order #{} created! Admin will set the price soon.",
-        'price_set': """💰 Price for order #{}: {} ₽.
-Deadline: {} days.
-{}
-
-Confirm order:""",
-        'prepayment_required': "⚠️ 100% prepayment required ({} ₽) as amount < 5000 ₽. Will be deducted from balance.",
+        'price_set': "💰 Price for order #{}: {} ₽\nDeadline: {} days\n{}\n\nConfirm order:",
+        'prepayment_required': "⚠️ 100% prepayment required ({} ₽) as amount < {} ₽. Will be deducted from balance.",
         'no_prepayment': "✅ No prepayment needed. Pay after testing.",
         'accept_price': "✅ Accept",
         'suggest_price': "💬 Suggest price",
@@ -567,29 +538,16 @@ Confirm order:""",
         'not_enough_balance': "❌ Not enough balance. Please deposit.",
         'prepayment_done': "✅ Prepayment {} ₽ deducted. Order assigned to developer.",
         'order_confirmed': "✅ Order confirmed. Development will start soon.",
-        'new_order_admin': """🆕 New order #{}
-👤 Client: @{}/{}
-📱 Platform: {}
-📂 Topic: {}
-📝 Description: {}
-🎟 Promo: {}""",
-        'set_price': "💰 Set price",
+        'new_order_admin': "🆕 New order #{}\n👤 Client: @{}/{}\n📱 Platform: {}\n📂 Topic: {}\n📝 Description: {}\n🎟 Promo: {}",
+        'set_price': "💰 Set price and deadline",
         'enter_price': "Enter price for order #{} (number only):",
         'enter_deadline': "Enter deadline in days for order #{}:",
         'price_updated': "✅ Price and deadline set.",
         'choose_developer': "Choose developer for order #{}:",
         'developer_set': "✅ Developer assigned.",
-        'developer_assigned': """🔔 New order #{} assigned!
-📱 {} | 📂 {}
-📝 {}
-Deadline: {} days
-
-Press 'Send test bot' when ready.""",
+        'developer_assigned': "🔔 New order #{} assigned!\n📱 {} | 📂 {}\n📝 {}\nDeadline: {} days\n\nPress 'Send test bot' when ready.",
         'send_test_bot': "Send test bot username (e.g., @my_test_bot):",
-        'test_bot_sent': """🤖 Your bot is ready!
-Test it here: {}
-
-After testing press 'Next'.""",
+        'test_bot_sent': "🤖 Your bot is ready!\nTest it here: {}\n\nAfter testing press 'Next'.",
         'test_bot_received': "✅ Test bot received. Client notified.",
         'next': "➡️ Next",
         'pay': "💰 Pay",
@@ -600,7 +558,7 @@ After testing press 'Next'.""",
         'max_revisions': "❌ Revision limit reached (3/3). Further revisions technically impossible.",
         'order_paid': "✅ Order paid! Admin will prepare source code.",
         'order_refused': "🚫 Order cancelled. {}",
-        'prepayment_kept': "Prepayment {} ₽ kept by shop (order < 5000 ₽).",
+        'prepayment_kept': "Prepayment {} ₽ kept by shop (order < {} ₽).",
         'no_prepayment_return': "No prepayment was required.",
         'send_zip_admin': "📦 Order #{} paid. Send ZIP file with source code (reply to this message):",
         'zip_sent': "📦 Source code received! Thank you for order.",
@@ -608,28 +566,13 @@ After testing press 'Next'.""",
         'review_text': "Write review text:",
         'review_thanks': "Thank you for review!",
         'enter_deposit': "Enter deposit amount (₽):",
-        'deposit_info': """Transfer {} ₽ to card:
-{}
-
-Comment: deposit {}
-
-After transfer send screenshot:""",
+        'deposit_info': "Transfer {} ₽ to card:\n{}\n\nComment: deposit {}\n\nAfter transfer send screenshot:",
         'deposit_sent': "⏳ Deposit request sent. Awaiting confirmation.",
-        'enter_withdraw': """Enter amount, full name and card number separated by commas:
-(Example: 5000, Ivanov I.I., 4276123456789012)""",
+        'enter_withdraw': "Enter amount, full name and card number separated by commas:\n(Example: 5000, Ivanov I.I., 4276123456789012)",
         'withdraw_sent': "⏳ Withdrawal request sent.",
-        'referral_text': """👥 Your referral link:
-https://t.me/{}?start={}
-
-Invite friends and get {}% from their orders!""",
-        'new_balance_req': """💰 Deposit request #{}
-👤 @{}/{}
-💵 {} ₽""",
-        'new_withdrawal': """🏦 Withdrawal request #{}
-👤 @{}/{}
-💵 {} ₽
-👤 Name: {}
-💳 Card: {}""",
+        'referral_text': "👥 Your referral link:\nhttps://t.me/{}?start={}\n\nInvite friends and get {}% from their orders!",
+        'new_balance_req': "💰 Deposit request #{}\n👤 @{}/{}\n💵 {} ₽",
+        'new_withdrawal': "🏦 Withdrawal request #{}\n👤 @{}/{}\n💵 {} ₽\n👤 Name: {}\n💳 Card: {}",
         'confirm': "✅ Confirm",
         'reject': "❌ Reject",
         'balance_confirmed': "✅ Balance deposited: {} ₽",
@@ -643,8 +586,7 @@ Invite friends and get {}% from their orders!""",
         'dev_removed': "✅ Developer role removed.",
         'enter_broadcast': "Enter broadcast text for all users:",
         'broadcast_done': "✅ Broadcast done. Delivered: {}",
-        'enter_promo': """Enter: CODE, TYPE(percent/fixed), VALUE, MAX_USES
-Example: SALE10, percent, 10, 50""",
+        'enter_promo': "Enter: CODE, TYPE(percent/fixed), VALUE, MAX_USES\nExample: SALE10, percent, 10, 50",
         'promo_created': "✅ Promo code created.",
         'enter_promo_code': "Have a promo code?",
         'promo_applied': "🎟 Promo applied! Discount: {} ₽",
@@ -663,11 +605,7 @@ Example: SALE10, percent, 10, 50""",
         'status_reviewed': "⭐ Completed",
         'status_cancelled': "❌ Cancelled",
         'no_orders': "You have no orders yet.",
-        'order_info': """📦 Order #{}
-📊 Status: {}
-💰 Price: {} ₽
-📱 {} | 📂 {}
-📝 {}""",
+        'order_info': "📦 Order #{}\n📊 Status: {}\n💰 Price: {} ₽\n📱 {} | 📂 {}\n📝 {}",
         'order_list': "📦 Order #{} — {}",
         'banned': "🚫 You are banned.",
         'back': "🔙 Back",
@@ -675,10 +613,7 @@ Example: SALE10, percent, 10, 50""",
         'choose_language': "🌐 Choose language:",
         'language_set': "✅ Language changed.",
         'my_balance': "💰 Your balance: {:.2f} ₽",
-        'admin_stats': """📊 Stats
-Total orders: {}
-Active: {}
-Users: {}""",
+        'admin_stats': "📊 Stats\nTotal orders: {}\nActive: {}\nUsers: {}",
         'send_test_bot_btn': "🤖 Send test bot",
         'send_zip_btn': "📦 Send ZIP to client",
         'no_developers': "No available developers.",
@@ -703,6 +638,24 @@ Users: {}""",
         'dev_cancel_order': "❌ Cancel order",
         'admin_only': "🚫 Admin only.",
         'dev_only': "🚫 Developer only.",
+        'cancel': "❌ Cancel",
+        'back_to_menu': "🔙 Back to menu",
+        'enter_custom_deadline': "Enter number of days:",
+        'choose_deadline_buttons': "Choose deadline:",
+        'day': "{} days",
+        'admin_menu_title': "🔧 Admin panel\n\nChoose section:",
+        'admin_orders_btn': "📦 Orders",
+        'admin_deposits_btn': "💰 Deposits",
+        'admin_withdrawals_btn': "🏦 Withdrawals",
+        'admin_staff_btn': "👥 Staff management",
+        'admin_broadcast_btn': "📢 Broadcast",
+        'admin_promos_btn': "🎟 Promo codes",
+        'staff_setdev': "Assign developer",
+        'staff_removedev': "Remove developer",
+        'staff_ban': "Ban",
+        'staff_unban': "Unban",
+        'staff_back': "🔙 Back",
+        'order_details': "📦 Order #{}\n👤 Client: {}\n📱 {} | 📂 {}\n💰 {} ₽ | Deadline: {} days\n📝 {}",
     }
 }
 
@@ -714,99 +667,54 @@ async def get_text(user_id: int, key: str, *args) -> str:
     except Exception:
         return text
 
+
 # ==================== KEYBOARDS ====================
 async def main_menu_keyboard(tg_id: int):
     user = await get_user(tg_id)
     role = user['role'] if user else 'user'
     lang = await get_user_lang(tg_id)
     t = TEXTS[lang]
-    buttons = [
-        [KeyboardButton(t['new_order']), KeyboardButton(t['my_orders'])],
-        [KeyboardButton(t['balance']), KeyboardButton(t['deposit'])],
-        [KeyboardButton(t['referral']), KeyboardButton(t['settings'])],
-    ]
-    if role == 'developer':
-        buttons.append([KeyboardButton(t['developer_panel'])])
-        buttons.append([KeyboardButton(t['withdraw'])])
+
+    # Admin sees ALL buttons
     if role == 'admin':
-        buttons.append([KeyboardButton(t['admin_panel'])])
+        buttons = [
+            [KeyboardButton(t['new_order']), KeyboardButton(t['my_orders'])],
+            [KeyboardButton(await get_text(tg_id, 'my_balance', await get_balance(tg_id))), KeyboardButton(t['deposit'])],
+            [KeyboardButton(t['referral']), KeyboardButton(t['settings'])],
+            [KeyboardButton(t['developer_panel']), KeyboardButton(t['withdraw'])],
+            [KeyboardButton(t['admin_panel'])],
+        ]
+    elif role == 'developer':
+        buttons = [
+            [KeyboardButton(t['new_order']), KeyboardButton(t['my_orders'])],
+            [KeyboardButton(await get_text(tg_id, 'my_balance', await get_balance(tg_id))), KeyboardButton(t['deposit'])],
+            [KeyboardButton(t['referral']), KeyboardButton(t['settings'])],
+            [KeyboardButton(t['developer_panel']), KeyboardButton(t['withdraw'])],
+        ]
+    else:
+        buttons = [
+            [KeyboardButton(t['new_order']), KeyboardButton(t['my_orders'])],
+            [KeyboardButton(await get_text(tg_id, 'my_balance', await get_balance(tg_id))), KeyboardButton(t['deposit'])],
+            [KeyboardButton(t['referral']), KeyboardButton(t['settings'])],
+        ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
+async def cancel_keyboard(tg_id: int):
+    lang = await get_user_lang(tg_id)
+    t = TEXTS[lang]
+    return ReplyKeyboardMarkup([[KeyboardButton(t['cancel'])]], resize_keyboard=True)
+
+async def back_keyboard(tg_id: int):
+    lang = await get_user_lang(tg_id)
+    t = TEXTS[lang]
+    return ReplyKeyboardMarkup([[KeyboardButton(t['back_to_menu'])]], resize_keyboard=True)
 
 # ==================== COMMANDS ====================
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = update.effective_user.id
-    if tg_id != ADMIN_ID:
-        await update.message.reply_text(await get_text(tg_id, 'admin_only'))
-        return
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📦 Orders", callback_data="admin_orders")],
-        [InlineKeyboardButton("💰 Deposits", callback_data="admin_deposits")],
-        [InlineKeyboardButton("🏦 Withdrawals", callback_data="admin_withdrawals")],
-        [InlineKeyboardButton("👥 Staff management", callback_data="admin_staff")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("🎟 Promo codes", callback_data="admin_promos")],
-    ])
-    await update.message.reply_text("Admin panel", reply_markup=kb)
-
-async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = update.effective_user.id
-    user = await get_user(tg_id)
-    if not user or user['role'] not in ('developer', 'admin'):
-        await update.message.reply_text(await get_text(tg_id, 'dev_only'))
-        return
-
-    # Check if dev has active order
-    active_orders = await get_orders_by_developer(tg_id)
-    if active_orders:
-        # Show work panel for active order
-        order = active_orders[0]
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(await get_text(tg_id, 'send_test_bot_btn'), callback_data=f"dev_sendbot_{order['id']}")],
-            [InlineKeyboardButton(await get_text(tg_id, 'dev_extend_deadline').format(DEV_DEADLINE_EXTENSION), callback_data=f"dev_extend_{order['id']}")],
-            [InlineKeyboardButton(await get_text(tg_id, 'dev_cancel_order'), callback_data=f"dev_cancelconfirm_{order['id']}")],
-        ])
-        await update.message.reply_text(
-            f"Order #{order['id']}\n{order['platform']} | {order['topic']}\nDeadline: {order['deadline_days']} days\n{order['description']}",
-            reply_markup=kb
-        )
-    else:
-        await update.message.reply_text("No active orders. Use /list to find available orders.")
-
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tg_id = update.effective_user.id
-    user = await get_user(tg_id)
-    if not user or user['role'] not in ('developer', 'admin'):
-        await update.message.reply_text(await get_text(tg_id, 'dev_only'))
-        return
-
-    # Check if developer already has active order (not admin)
-    if user['role'] == 'developer':
-        active_orders = await get_orders_by_developer(tg_id)
-        if active_orders:
-            await update.message.reply_text(await get_text(tg_id, 'dev_max_orders'))
-            return
-
-    orders = await get_available_orders()
-    if not orders:
-        await update.message.reply_text(await get_text(tg_id, 'list_empty'))
-        return
-
-    await update.message.reply_text(await get_text(tg_id, 'list_title'))
-    for o in orders:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(await get_text(tg_id, 'take_order', o['id']), callback_data=f"list_take_{o['id']}")]
-        ])
-        await update.message.reply_text(
-            f"Order #{o['id']}\nPlatform: {o['platform']}\nTopic: {o['topic']}\nPrice: {o['price']} ₽\nDeadline: {o['deadline_days']} days\n{o['description'][:100]}...",
-            reply_markup=kb
-        )
-
-# ==================== START & LANGUAGE ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     username = update.effective_user.username or "no_username"
     args = context.args
+    clear_state(context)
     user = await get_user(tg_id)
     if user and user['banned']:
         await update.message.reply_text(await get_text(tg_id, 'banned'))
@@ -821,6 +729,78 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("👋 Welcome / Добро пожаловать!\nChoose language / Выберите язык:", reply_markup=kb)
     else:
         await update.message.reply_text(await get_text(tg_id, 'menu'), reply_markup=await main_menu_keyboard(tg_id))
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    clear_state(context)
+    if tg_id != ADMIN_ID:
+        await update.message.reply_text(await get_text(tg_id, 'admin_only'))
+        return
+    lang = await get_user_lang(tg_id)
+    t = TEXTS[lang]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(t['admin_orders_btn'], callback_data="admin_orders")],
+        [InlineKeyboardButton(t['admin_deposits_btn'], callback_data="admin_deposits")],
+        [InlineKeyboardButton(t['admin_withdrawals_btn'], callback_data="admin_withdrawals")],
+        [InlineKeyboardButton(t['admin_staff_btn'], callback_data="admin_staff")],
+        [InlineKeyboardButton(t['admin_broadcast_btn'], callback_data="admin_broadcast")],
+        [InlineKeyboardButton(t['admin_promos_btn'], callback_data="admin_promos")],
+    ])
+    await update.message.reply_text(t['admin_menu_title'], reply_markup=kb)
+
+async def cmd_dev(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    clear_state(context)
+    user = await get_user(tg_id)
+    if not user or user['role'] not in ('developer', 'admin'):
+        await update.message.reply_text(await get_text(tg_id, 'dev_only'))
+        return
+
+    active_orders = await get_orders_by_developer(tg_id)
+    if active_orders:
+        order = active_orders[0]
+        lang = await get_user_lang(tg_id)
+        t = TEXTS[lang]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(t['send_test_bot_btn'], callback_data=f"dev_sendbot_{order['id']}")],
+            [InlineKeyboardButton(t['dev_extend_deadline'].format(DEV_DEADLINE_EXTENSION), callback_data=f"dev_extend_{order['id']}")],
+            [InlineKeyboardButton(t['dev_cancel_order'], callback_data=f"dev_cancelconfirm_{order['id']}")],
+        ])
+        await update.message.reply_text(
+            f"📦 Заказ #{order['id']}\n📱 {order['platform']} | 📂 {order['topic']}\n⏳ Срок: {order['deadline_days']} дней\n📝 {order['description']}",
+            reply_markup=kb
+        )
+    else:
+        await update.message.reply_text("Нет активных заказов. Используйте /list чтобы найти доступные.")
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_id = update.effective_user.id
+    clear_state(context)
+    user = await get_user(tg_id)
+    if not user or user['role'] not in ('developer', 'admin'):
+        await update.message.reply_text(await get_text(tg_id, 'dev_only'))
+        return
+
+    if user['role'] == 'developer':
+        active = await get_orders_by_developer(tg_id)
+        if active:
+            await update.message.reply_text(await get_text(tg_id, 'dev_max_orders'))
+            return
+
+    orders = await get_available_orders()
+    if not orders:
+        await update.message.reply_text(await get_text(tg_id, 'list_empty'))
+        return
+
+    await update.message.reply_text(await get_text(tg_id, 'list_title'))
+    for o in orders:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(await get_text(tg_id, 'take_order', o['id']), callback_data=f"list_take_{o['id']}")]
+        ])
+        await update.message.reply_text(
+            f"📦 Заказ #{o['id']}\n📱 {o['platform']} | 📂 {o['topic']}\n💰 {o['price']} ₽ | ⏳ {o['deadline_days']} дней\n📝 {o['description'][:100]}...",
+            reply_markup=kb
+        )
 
 async def set_language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -846,7 +826,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = user['language']
     t = TEXTS[lang]
 
+    # Cancel button pressed
+    if text == t['cancel'] or text == t['back_to_menu']:
+        clear_state(context)
+        await update.message.reply_text(t['menu'], reply_markup=await main_menu_keyboard(tg_id))
+        return
+
     state = context.user_data.get('state')
+
     if state == 'order_desc':
         context.user_data['description'] = text
         context.user_data['state'] = 'order_promo'
@@ -854,7 +841,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(t['use_promo'], callback_data="promo_yes")],
             [InlineKeyboardButton(t['skip_promo'], callback_data="promo_no")]
         ])
-        await update.message.reply_text(await get_text(tg_id, 'enter_promo_code'), reply_markup=kb)
+        await update.message.reply_text(t['enter_promo_code'], reply_markup=kb)
         return
     elif state == 'order_promo_input':
         promo_code = None
@@ -862,9 +849,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             promo = await get_promo_code(text.strip())
             if promo and promo['uses_count'] < promo['max_uses']:
                 promo_code = text.strip().upper()
-                await update.message.reply_text(await get_text(tg_id, 'promo_applied', promo['value']))
+                await update.message.reply_text(t['promo_applied'].format(promo['value']))
             else:
-                await update.message.reply_text(await get_text(tg_id, 'invalid_promo'))
+                await update.message.reply_text(t['invalid_promo'])
                 return
         order_id = await create_order(tg_id, context.user_data['platform'], context.user_data['topic'], context.user_data['description'], promo_code)
         user_data = await get_user(tg_id)
@@ -875,80 +862,73 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton(await get_text(ADMIN_ID, 'set_price'), callback_data=f"admin_setprice_{order_id}")]
             ])
         )
-        context.user_data.pop('state', None)
-        context.user_data.pop('platform', None)
-        context.user_data.pop('topic', None)
-        context.user_data.pop('description', None)
-        await update.message.reply_text(await get_text(tg_id, 'order_created', order_id), reply_markup=await main_menu_keyboard(tg_id))
+        clear_state(context)
+        await update.message.reply_text(t['order_created'].format(order_id), reply_markup=await main_menu_keyboard(tg_id))
         return
     elif state == 'enter_price':
         try:
             price = float(text.strip())
         except ValueError:
-            await update.message.reply_text("Enter a number.")
+            await update.message.reply_text("Введите число.", reply_markup=await cancel_keyboard(tg_id))
             return
         context.user_data['temp_price'] = price
         context.user_data['state'] = 'enter_deadline'
         order_id = context.user_data['admin_order_id']
-        await update.message.reply_text(await get_text(tg_id, 'enter_deadline', order_id))
+        await update.message.reply_text(t['enter_deadline'].format(order_id), reply_markup=await cancel_keyboard(tg_id))
         return
     elif state == 'enter_deadline':
         try:
             days = int(text.strip())
         except ValueError:
-            await update.message.reply_text("Enter a whole number.")
+            await update.message.reply_text("Введите целое число.", reply_markup=await cancel_keyboard(tg_id))
             return
         order_id = context.user_data['admin_order_id']
         price = context.user_data['temp_price']
         await update_order(order_id, price=price, deadline_days=days, status='price_set')
         order = await get_order(order_id)
-        prepayment_text = await get_text(order['user_id'], 'prepayment_required', price) if price < PREPAYMENT_LIMIT else await get_text(order['user_id'], 'no_prepayment')
+        prepayment_text = t['prepayment_required'].format(price, PREPAYMENT_LIMIT) if price < PREPAYMENT_LIMIT else t['no_prepayment']
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(await get_text(order['user_id'], 'accept_price'), callback_data=f"user_acceptprice_{order_id}")],
-            [InlineKeyboardButton(await get_text(order['user_id'], 'suggest_price'), callback_data=f"user_suggestprice_{order_id}")],
-            [InlineKeyboardButton(await get_text(order['user_id'], 'cancel_order'), callback_data=f"user_cancelorder_{order_id}")]
+            [InlineKeyboardButton(t['accept_price'], callback_data=f"user_acceptprice_{order_id}")],
+            [InlineKeyboardButton(t['suggest_price'], callback_data=f"user_suggestprice_{order_id}")],
+            [InlineKeyboardButton(t['cancel_order'], callback_data=f"user_cancelorder_{order_id}")]
         ])
         await context.bot.send_message(
             chat_id=order['user_id'],
-            text=await get_text(order['user_id'], 'price_set', order_id, price, days, prepayment_text),
+            text=t['price_set'].format(order_id, price, days, prepayment_text),
             reply_markup=kb
         )
-        context.user_data.pop('state', None)
-        context.user_data.pop('admin_order_id', None)
-        context.user_data.pop('temp_price', None)
-        await update.message.reply_text(await get_text(tg_id, 'price_updated'))
+        clear_state(context)
+        await update.message.reply_text(t['price_updated'], reply_markup=await main_menu_keyboard(tg_id))
         return
     elif state == 'user_suggest_price':
         try:
             price = float(text.strip())
         except ValueError:
-            await update.message.reply_text("Enter a number.")
+            await update.message.reply_text("Введите число.", reply_markup=await cancel_keyboard(tg_id))
             return
         context.user_data['temp_negoprice'] = price
         context.user_data['state'] = 'user_suggest_deadline'
-        await update.message.reply_text(await get_text(tg_id, 'enter_your_deadline'))
+        await update.message.reply_text(t['enter_your_deadline'], reply_markup=await cancel_keyboard(tg_id))
         return
     elif state == 'user_suggest_deadline':
         try:
             days = int(text.strip())
         except ValueError:
-            await update.message.reply_text("Enter a whole number.")
+            await update.message.reply_text("Введите целое число.", reply_markup=await cancel_keyboard(tg_id))
             return
         order_id = context.user_data['suggest_order_id']
         price = context.user_data['temp_negoprice']
         await update_order(order_id, status='price_negotiation')
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=f"Client suggested price {price} RUB, deadline {days} days for order #{order_id}.",
+            text=f"Клиент предложил цену {price} ₽, срок {days} дней для заказа #{order_id}.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Accept", callback_data=f"admin_acceptnegoprice_{order_id}_{price}_{days}")],
-                [InlineKeyboardButton("Reject", callback_data=f"admin_rejectnegoprice_{order_id}")]
+                [InlineKeyboardButton("Принять", callback_data=f"admin_acceptnegoprice_{order_id}_{price}_{days}")],
+                [InlineKeyboardButton("Отклонить", callback_data=f"admin_rejectnegoprice_{order_id}")]
             ])
         )
-        context.user_data.pop('state', None)
-        context.user_data.pop('suggest_order_id', None)
-        context.user_data.pop('temp_negoprice', None)
-        await update.message.reply_text(await get_text(tg_id, 'price_sent'))
+        clear_state(context)
+        await update.message.reply_text(t['price_sent'], reply_markup=await main_menu_keyboard(tg_id))
         return
     elif state == 'dev_send_bot':
         order_id = context.user_data['dev_order_id']
@@ -963,26 +943,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=await get_text(order['user_id'], 'test_bot_sent', username),
             reply_markup=kb
         )
-        context.user_data.pop('state', None)
-        context.user_data.pop('dev_order_id', None)
-        await update.message.reply_text(await get_text(tg_id, 'test_bot_received'))
+        clear_state(context)
+        await update.message.reply_text(t['test_bot_received'], reply_markup=await main_menu_keyboard(tg_id))
         return
     elif state == 'user_revision':
         order_id = context.user_data['revision_order_id']
         order = await get_order(order_id)
         new_count = order['revision_count'] + 1
         if new_count > 3:
-            await update.message.reply_text(await get_text(tg_id, 'max_revisions'))
-            context.user_data.pop('state', None)
+            await update.message.reply_text(t['max_revisions'])
+            clear_state(context)
             return
         await update_order(order_id, revision_count=new_count, status='revision')
         await context.bot.send_message(
             chat_id=order['developer_id'],
-            text=f"🔧 Revisions for order #{order_id} ({new_count}/3):\n{text}"
+            text=f"🔧 Правки по заказу #{order_id} ({new_count}/3):\n{text}"
         )
-        context.user_data.pop('state', None)
-        context.user_data.pop('revision_order_id', None)
-        await update.message.reply_text(await get_text(tg_id, 'revision_sent', 3 - new_count))
+        clear_state(context)
+        await update.message.reply_text(t['revision_sent'].format(3 - new_count), reply_markup=await main_menu_keyboard(tg_id))
         return
     elif state == 'user_review_text':
         order_id = context.user_data['review_order_id']
@@ -991,42 +969,39 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_order(order_id, status='reviewed')
         order = await get_order(order_id)
         user_data = await get_user(tg_id)
-        channel_text = f"⭐ Review for order #{order_id}\nRating: {'⭐' * rating}\nClient: @{user_data['username'] or 'N/A'}\nText: {text}"
+        channel_text = f"⭐ Отзыв по заказу #{order_id}\nОценка: {'⭐' * rating}\nКлиент: @{user_data['username'] or 'N/A'}\nТекст: {text}"
         await context.bot.send_message(chat_id=REVIEWS_CHANNEL, text=channel_text)
-        context.user_data.pop('state', None)
-        context.user_data.pop('review_order_id', None)
-        context.user_data.pop('review_rating', None)
-        await update.message.reply_text(await get_text(tg_id, 'review_thanks'))
+        clear_state(context)
+        await update.message.reply_text(t['review_thanks'], reply_markup=await main_menu_keyboard(tg_id))
         return
     elif state == 'deposit_amount':
         try:
             amount = float(text.strip())
         except ValueError:
-            await update.message.reply_text("Enter a number.")
+            await update.message.reply_text("Введите число.", reply_markup=await cancel_keyboard(tg_id))
             return
         context.user_data['deposit_amount'] = amount
         context.user_data['state'] = 'deposit_proof'
-        bot_username = (await context.bot.get_me()).username
         await update.message.reply_text(
-            await get_text(tg_id, 'deposit_info', amount, CARD_DETAILS, tg_id),
+            t['deposit_info'].format(amount, CARD_DETAILS, tg_id),
             reply_markup=ReplyKeyboardRemove()
         )
         return
     elif state == 'withdraw_amount':
         parts = text.split(',')
         if len(parts) != 3:
-            await update.message.reply_text("Invalid format. Use commas.")
+            await update.message.reply_text("Неверный формат. Введите через запятую.", reply_markup=await cancel_keyboard(tg_id))
             return
         try:
             amount = float(parts[0].strip())
         except ValueError:
-            await update.message.reply_text("Invalid amount.")
+            await update.message.reply_text("Неверная сумма.", reply_markup=await cancel_keyboard(tg_id))
             return
         initials = parts[1].strip()
         card = parts[2].strip()
         balance = await get_balance(tg_id)
         if balance < amount:
-            await update.message.reply_text(await get_text(tg_id, 'insufficient_funds', amount, balance))
+            await update.message.reply_text(t['insufficient_funds'].format(amount, balance), reply_markup=await main_menu_keyboard(tg_id))
             return
         req_id = await create_withdrawal_request(tg_id, amount, initials, card)
         user_data = await get_user(tg_id)
@@ -1038,8 +1013,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton(await get_text(ADMIN_ID, 'reject'), callback_data=f"rej_withdraw_{req_id}")]
             ])
         )
-        context.user_data.pop('state', None)
-        await update.message.reply_text(await get_text(tg_id, 'withdraw_sent'), reply_markup=await main_menu_keyboard(tg_id))
+        clear_state(context)
+        await update.message.reply_text(t['withdraw_sent'], reply_markup=await main_menu_keyboard(tg_id))
         return
     elif state == 'admin_broadcast':
         users = await get_all_users()
@@ -1050,13 +1025,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 count += 1
             except Exception:
                 pass
-        context.user_data.pop('state', None)
-        await update.message.reply_text(await get_text(tg_id, 'broadcast_done', count))
+        clear_state(context)
+        await update.message.reply_text(t['broadcast_done'].format(count), reply_markup=await main_menu_keyboard(tg_id))
         return
     elif state == 'admin_promo':
         parts = text.split(',')
         if len(parts) != 4:
-            await update.message.reply_text("Invalid format.")
+            await update.message.reply_text("Неверный формат.", reply_markup=await cancel_keyboard(tg_id))
             return
         code = parts[0].strip().upper()
         ptype = parts[1].strip()
@@ -1064,11 +1039,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             value = float(parts[2].strip())
             max_uses = int(parts[3].strip())
         except ValueError:
-            await update.message.reply_text("Invalid numbers.")
+            await update.message.reply_text("Неверные числа.", reply_markup=await cancel_keyboard(tg_id))
             return
         await create_promo_code(code, ptype, value, max_uses)
-        context.user_data.pop('state', None)
-        await update.message.reply_text(await get_text(tg_id, 'promo_created'))
+        clear_state(context)
+        await update.message.reply_text(t['promo_created'], reply_markup=await main_menu_keyboard(tg_id))
         return
     elif state == 'admin_staff':
         target_id = None
@@ -1082,39 +1057,40 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if row:
                         target_id = dict(row)['tg_id']
         if not target_id:
-            await update.message.reply_text("User not found.")
+            await update.message.reply_text("Пользователь не найден.", reply_markup=await cancel_keyboard(tg_id))
             return
         action = context.user_data.get('staff_action')
         if action == 'setdev':
             await update_user_role(target_id, 'developer')
-            msg = await get_text(tg_id, 'dev_assigned')
+            msg = t['dev_assigned']
         elif action == 'removedev':
             await update_user_role(target_id, 'user')
-            msg = await get_text(tg_id, 'dev_removed')
+            msg = t['dev_removed']
         elif action == 'ban':
             await ban_user(target_id, 1)
-            msg = await get_text(tg_id, 'user_banned')
+            msg = t['user_banned']
         elif action == 'unban':
             await ban_user(target_id, 0)
-            msg = await get_text(tg_id, 'user_unbanned')
+            msg = t['user_unbanned']
         else:
-            msg = "Done."
-        context.user_data.pop('state', None)
-        context.user_data.pop('staff_action', None)
-        await update.message.reply_text(msg)
+            msg = "Готово."
+        clear_state(context)
+        await update.message.reply_text(msg, reply_markup=await main_menu_keyboard(tg_id))
         return
 
     # Main menu buttons
     if text == t['new_order']:
+        clear_state(context)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(t['telegram'], callback_data="platform_telegram"),
              InlineKeyboardButton(t['vk'], callback_data="platform_vk")]
         ])
-        await update.message.reply_text(await get_text(tg_id, 'choose_platform'), reply_markup=kb)
+        await update.message.reply_text(t['choose_platform'], reply_markup=kb)
     elif text == t['my_orders']:
+        clear_state(context)
         orders = await get_orders_by_user(tg_id)
         if not orders:
-            await update.message.reply_text(await get_text(tg_id, 'no_orders'))
+            await update.message.reply_text(t['no_orders'])
             return
         msg = ""
         for o in orders:
@@ -1122,35 +1098,47 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_text = TEXTS[lang].get(status_key, o['status'])
             if o['status'] == 'revision':
                 status_text = status_text.format(o['revision_count'])
-            msg += await get_text(tg_id, 'order_list', o['id'], status_text) + "\n"
-        await update.message.reply_text(msg)
-    elif text == t['balance']:
+            msg += t['order_list'].format(o['id'], status_text) + "\n"
+        await update.message.reply_text(msg, reply_markup=await main_menu_keyboard(tg_id))
+    elif text.startswith("💰 Баланс") or text.startswith("💰 Balance"):
+        clear_state(context)
         bal = await get_balance(tg_id)
-        await update.message.reply_text(await get_text(tg_id, 'my_balance', bal))
+        await update.message.reply_text(t['my_balance'].format(bal), reply_markup=await main_menu_keyboard(tg_id))
     elif text == t['deposit']:
+        clear_state(context)
         context.user_data['state'] = 'deposit_amount'
-        await update.message.reply_text(await get_text(tg_id, 'enter_deposit'))
+        await update.message.reply_text(t['enter_deposit'], reply_markup=await cancel_keyboard(tg_id))
     elif text == t['withdraw']:
+        clear_state(context)
         context.user_data['state'] = 'withdraw_amount'
-        await update.message.reply_text(await get_text(tg_id, 'enter_withdraw'))
+        await update.message.reply_text(t['enter_withdraw'], reply_markup=await cancel_keyboard(tg_id))
     elif text == t['referral']:
+        clear_state(context)
         user_data = await get_user(tg_id)
         bot_username = (await context.bot.get_me()).username
-        await update.message.reply_text(await get_text(tg_id, 'referral_text', bot_username, user_data['referral_code'], int(REFERRAL_PERCENT)))
+        await update.message.reply_text(t['referral_text'].format(bot_username, user_data['referral_code'], int(REFERRAL_PERCENT)), reply_markup=await main_menu_keyboard(tg_id))
     elif text == t['settings']:
+        clear_state(context)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🇷🇺 Русский", callback_data="setlang_ru"),
              InlineKeyboardButton("🇬🇧 English", callback_data="setlang_en")]
         ])
-        await update.message.reply_text(await get_text(tg_id, 'choose_language'), reply_markup=kb)
+        await update.message.reply_text(t['choose_language'], reply_markup=kb)
     elif text == t['admin_panel']:
+        clear_state(context)
         if tg_id == ADMIN_ID:
             await cmd_admin(update, context)
+        else:
+            await update.message.reply_text(t['admin_only'])
     elif text == t['developer_panel']:
+        clear_state(context)
         if user['role'] in ('developer', 'admin'):
             await cmd_dev(update, context)
+        else:
+            await update.message.reply_text(t['dev_only'])
     else:
-        await update.message.reply_text(await get_text(tg_id, 'menu'), reply_markup=await main_menu_keyboard(tg_id))
+        clear_state(context)
+        await update.message.reply_text(t['menu'], reply_markup=await main_menu_keyboard(tg_id))
 
 
 # ==================== CALLBACK HANDLER ====================
@@ -1175,41 +1163,41 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(t['entertainment'], callback_data="topic_entertainment")],
             [InlineKeyboardButton(t['other'], callback_data="topic_other")],
         ]
-        await query.edit_message_text(await get_text(tg_id, 'choose_topic'), reply_markup=InlineKeyboardMarkup(topics))
+        await query.edit_message_text(t['choose_topic'], reply_markup=InlineKeyboardMarkup(topics))
     elif data.startswith("topic_"):
         topic = data.split('_')[1]
         context.user_data['topic'] = topic
         context.user_data['state'] = 'order_desc'
-        await query.edit_message_text(await get_text(tg_id, 'send_tz'))
+        await query.edit_message_text(t['send_tz'])
+        await context.bot.send_message(chat_id=tg_id, text=t['send_tz'], reply_markup=await cancel_keyboard(tg_id))
     elif data == "promo_yes":
         context.user_data['state'] = 'order_promo_input'
-        await query.edit_message_text("Enter promo code:")
+        await query.edit_message_text("Введите промокод:")
+        await context.bot.send_message(chat_id=tg_id, text="Введите промокод:", reply_markup=await cancel_keyboard(tg_id))
     elif data == "promo_no":
         order_id = await create_order(tg_id, context.user_data['platform'], context.user_data['topic'], context.user_data['description'], None)
         user_data = await get_user(tg_id)
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=await get_text(ADMIN_ID, 'new_order_admin', order_id, user_data['username'] or "N/A", tg_id, context.user_data['platform'], context.user_data['topic'], context.user_data['description'], "-"),
+            text=t['new_order_admin'].format(order_id, user_data['username'] or "N/A", tg_id, context.user_data['platform'], context.user_data['topic'], context.user_data['description'], "-"),
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(await get_text(ADMIN_ID, 'set_price'), callback_data=f"admin_setprice_{order_id}")]
+                [InlineKeyboardButton(t['set_price'], callback_data=f"admin_setprice_{order_id}")]
             ])
         )
-        context.user_data.pop('state', None)
-        context.user_data.pop('platform', None)
-        context.user_data.pop('topic', None)
-        context.user_data.pop('description', None)
-        await query.edit_message_text(await get_text(tg_id, 'order_created', order_id))
-        await context.bot.send_message(chat_id=tg_id, text=await get_text(tg_id, 'menu'), reply_markup=await main_menu_keyboard(tg_id))
+        clear_state(context)
+        await query.edit_message_text(t['order_created'].format(order_id))
+        await context.bot.send_message(chat_id=tg_id, text=t['menu'], reply_markup=await main_menu_keyboard(tg_id))
     elif data.startswith("setlang_"):
         lang = data.split('_')[1]
         await update_user_language(tg_id, lang)
-        await query.edit_message_text(await get_text(tg_id, 'language_set'))
-        await context.bot.send_message(chat_id=tg_id, text=await get_text(tg_id, 'menu'), reply_markup=await main_menu_keyboard(tg_id))
+        await query.edit_message_text(t['language_set'])
+        await context.bot.send_message(chat_id=tg_id, text=t['menu'], reply_markup=await main_menu_keyboard(tg_id))
     elif data.startswith("admin_setprice_"):
         order_id = int(data.split('_')[2])
         context.user_data['admin_order_id'] = order_id
         context.user_data['state'] = 'enter_price'
-        await query.edit_message_text(await get_text(tg_id, 'enter_price', order_id))
+        await query.edit_message_text(t['enter_price'].format(order_id))
+        await context.bot.send_message(chat_id=tg_id, text=t['enter_price'].format(order_id), reply_markup=await cancel_keyboard(tg_id))
     elif data.startswith("user_acceptprice_"):
         order_id = int(data.split('_')[2])
         order = await get_order(order_id)
@@ -1217,31 +1205,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if price < PREPAYMENT_LIMIT:
             balance = await get_balance(tg_id)
             if balance < price:
-                await query.edit_message_text(await get_text(tg_id, 'not_enough_balance'))
+                await query.edit_message_text(t['not_enough_balance'])
                 return
             await update_balance(tg_id, -price)
             await update_order(order_id, status='waiting_prepayment')
-            await query.edit_message_text(await get_text(tg_id, 'prepayment_done', price))
+            await query.edit_message_text(t['prepayment_done'].format(price))
         else:
             await update_order(order_id, status='in_progress')
-            await query.edit_message_text(await get_text(tg_id, 'order_confirmed'))
-        # Notify admin or dev
+            await query.edit_message_text(t['order_confirmed'])
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=f"Order #{order_id} confirmed by client. Assign a developer or use /list.",
+            text=f"Заказ #{order_id} подтвержден клиентом. Назначьте разработчика или используйте /list.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Assign developer", callback_data=f"admin_assigndev_{order_id}")]
+                [InlineKeyboardButton("Назначить разработчика", callback_data=f"admin_assigndev_{order_id}")]
             ])
         )
     elif data.startswith("user_suggestprice_"):
         order_id = int(data.split('_')[2])
         context.user_data['suggest_order_id'] = order_id
         context.user_data['state'] = 'user_suggest_price'
-        await query.edit_message_text(await get_text(tg_id, 'enter_your_price'))
+        await query.edit_message_text(t['enter_your_price'])
+        await context.bot.send_message(chat_id=tg_id, text=t['enter_your_price'], reply_markup=await cancel_keyboard(tg_id))
     elif data.startswith("user_cancelorder_"):
         order_id = int(data.split('_')[2])
         await update_order(order_id, status='cancelled')
-        await query.edit_message_text(await get_text(tg_id, 'order_cancelled'))
+        await query.edit_message_text(t['order_cancelled'])
     elif data.startswith("admin_acceptnegoprice_"):
         parts = data.split('_')
         order_id = int(parts[2])
@@ -1249,30 +1237,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         days = int(parts[4])
         await update_order(order_id, price=price, deadline_days=days, status='price_set')
         order = await get_order(order_id)
-        prepayment_text = await get_text(order['user_id'], 'prepayment_required', price) if price < PREPAYMENT_LIMIT else await get_text(order['user_id'], 'no_prepayment')
+        prepayment_text = t['prepayment_required'].format(price, PREPAYMENT_LIMIT) if price < PREPAYMENT_LIMIT else t['no_prepayment']
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(await get_text(order['user_id'], 'accept_price'), callback_data=f"user_acceptprice_{order_id}")],
-            [InlineKeyboardButton(await get_text(order['user_id'], 'cancel_order'), callback_data=f"user_cancelorder_{order_id}")]
+            [InlineKeyboardButton(t['accept_price'], callback_data=f"user_acceptprice_{order_id}")],
+            [InlineKeyboardButton(t['cancel_order'], callback_data=f"user_cancelorder_{order_id}")]
         ])
         await context.bot.send_message(
             chat_id=order['user_id'],
-            text=await get_text(order['user_id'], 'price_set', order_id, price, days, prepayment_text),
+            text=t['price_set'].format(order_id, price, days, prepayment_text),
             reply_markup=kb
         )
-        await query.edit_message_text("Price and deadline updated and sent to client.")
+        await query.edit_message_text("Цена и срок обновлены и отправлены клиенту.")
     elif data.startswith("admin_rejectnegoprice_"):
         order_id = int(data.split('_')[2])
-        await query.edit_message_text(f"Order #{order_id}: price rejected. Waiting for admin price.")
+        await query.edit_message_text(f"Заказ #{order_id}: предложение отклонено. Ожидайте цену от админа.")
     elif data.startswith("admin_assigndev_"):
         order_id = int(data.split('_')[2])
         developers = await get_developers()
         if not developers:
-            await query.edit_message_text(await get_text(tg_id, 'no_developers'))
+            await query.edit_message_text(t['no_developers'])
             return
         buttons = []
         for dev in developers:
             buttons.append([InlineKeyboardButton(f"{dev['username'] or dev['tg_id']}", callback_data=f"admin_setdev_{order_id}_{dev['tg_id']}")])
-        await query.edit_message_text(await get_text(tg_id, 'choose_developer', order_id), reply_markup=InlineKeyboardMarkup(buttons))
+        buttons.append([InlineKeyboardButton(t['back'], callback_data="admin_back_orders")])
+        await query.edit_message_text(t['choose_developer'].format(order_id), reply_markup=InlineKeyboardMarkup(buttons))
     elif data.startswith("admin_setdev_"):
         parts = data.split('_')
         order_id = int(parts[2])
@@ -1286,12 +1275,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton(await get_text(dev_id, 'send_test_bot_btn'), callback_data=f"dev_sendbot_{order_id}")]
             ])
         )
-        await query.edit_message_text(await get_text(tg_id, 'developer_set'))
+        await query.edit_message_text(t['developer_set'])
+    elif data == "admin_back_orders":
+        await query.edit_message_text("Отменено.")
     elif data.startswith("dev_sendbot_"):
         order_id = int(data.split('_')[2])
         context.user_data['dev_order_id'] = order_id
         context.user_data['state'] = 'dev_send_bot'
-        await query.edit_message_text(await get_text(tg_id, 'send_test_bot'))
+        await query.edit_message_text(t['send_test_bot'])
+        await context.bot.send_message(chat_id=tg_id, text=t['send_test_bot'], reply_markup=await cancel_keyboard(tg_id))
     elif data.startswith("user_testnext_"):
         order_id = int(data.split('_')[2])
         kb = InlineKeyboardMarkup([
@@ -1299,7 +1291,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(t['revision'], callback_data=f"user_revision_{order_id}")],
             [InlineKeyboardButton(t['refuse'], callback_data=f"user_refuse_{order_id}")]
         ])
-        await query.edit_message_text(await get_text(tg_id, 'choose_action'), reply_markup=kb)
+        await query.edit_message_text(t['choose_action'], reply_markup=kb)
     elif data.startswith("user_payorder_"):
         order_id = int(data.split('_')[2])
         order = await get_order(order_id)
@@ -1323,13 +1315,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if remaining > 0:
                 balance = await get_balance(tg_id)
                 if balance < remaining:
-                    await query.edit_message_text(await get_text(tg_id, 'insufficient_funds', remaining, balance))
+                    await query.edit_message_text(t['insufficient_funds'].format(remaining, balance))
                     return
                 await update_balance(tg_id, -remaining)
         else:
             balance = await get_balance(tg_id)
             if balance < final_price:
-                await query.edit_message_text(await get_text(tg_id, 'insufficient_funds', final_price, balance))
+                await query.edit_message_text(t['insufficient_funds'].format(final_price, balance))
                 return
             await update_balance(tg_id, -final_price)
 
@@ -1340,7 +1332,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_balance(int(user_data['referred_by']), bonus)
         if order['developer_id']:
             dev_bonus = final_price * (DEV_PERCENT / 100)
-            # Apply penalty if exists
             dev_user = await get_user(order['developer_id'])
             if dev_user and dev_user['dev_penalty'] > 0:
                 penalty = min(dev_bonus, dev_user['dev_penalty'])
@@ -1352,10 +1343,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             await update_balance(order['developer_id'], dev_bonus)
 
-        await query.edit_message_text(await get_text(tg_id, 'order_paid'))
+        await query.edit_message_text(t['order_paid'])
         await context.bot.send_message(
             chat_id=ADMIN_ID,
-            text=await get_text(ADMIN_ID, 'send_zip_admin', order_id),
+            text=t['send_zip_admin'].format(order_id),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(await get_text(ADMIN_ID, 'send_zip_btn'), callback_data=f"admin_sendzip_{order_id}")]
             ])
@@ -1364,27 +1355,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = int(data.split('_')[2])
         order = await get_order(order_id)
         if order['revision_count'] >= 3:
-            await query.edit_message_text(await get_text(tg_id, 'max_revisions'))
+            await query.edit_message_text(t['max_revisions'])
             return
         context.user_data['revision_order_id'] = order_id
         context.user_data['state'] = 'user_revision'
-        await query.edit_message_text(await get_text(tg_id, 'enter_revision'))
+        await query.edit_message_text(t['enter_revision'])
+        await context.bot.send_message(chat_id=tg_id, text=t['enter_revision'], reply_markup=await cancel_keyboard(tg_id))
     elif data.startswith("user_refuse_"):
         order_id = int(data.split('_')[2])
         order = await get_order(order_id)
-        msg = await get_text(tg_id, 'no_prepayment_return')
+        msg = t['no_prepayment_return']
         if order['price'] < PREPAYMENT_LIMIT:
-            msg = await get_text(tg_id, 'prepayment_kept', order['price'])
+            msg = t['prepayment_kept'].format(order['price'], PREPAYMENT_LIMIT)
         await update_order(order_id, status='cancelled')
-        await query.edit_message_text(await get_text(tg_id, 'order_refused', msg))
-        await context.bot.send_message(chat_id=ADMIN_ID, text=f"❌ Client refused order #{order_id}. {msg}")
+        await query.edit_message_text(t['order_refused'].format(msg))
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"❌ Клиент отказался от заказа #{order_id}. {msg}")
         if order['developer_id']:
-            await context.bot.send_message(chat_id=order['developer_id'], text=f"❌ Order #{order_id} cancelled by client.")
+            await context.bot.send_message(chat_id=order['developer_id'], text=f"❌ Заказ #{order_id} отменен клиентом.")
     elif data.startswith("admin_sendzip_"):
         order_id = int(data.split('_')[2])
         context.user_data['zip_order_id'] = order_id
         context.user_data['state'] = 'admin_send_zip'
-        await query.edit_message_text(await get_text(tg_id, 'send_zip_admin', order_id))
+        await query.edit_message_text(t['send_zip_admin'].format(order_id))
+        await context.bot.send_message(chat_id=tg_id, text=t['send_zip_admin'].format(order_id))
     elif data.startswith("review_"):
         parts = data.split('_')
         order_id = int(parts[1])
@@ -1392,172 +1385,177 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['review_order_id'] = order_id
         context.user_data['review_rating'] = rating
         context.user_data['state'] = 'user_review_text'
-        await query.edit_message_text(await get_text(tg_id, 'review_text'))
+        await query.edit_message_text(t['review_text'])
+        await context.bot.send_message(chat_id=tg_id, text=t['review_text'], reply_markup=await cancel_keyboard(tg_id))
     elif data == "admin_orders":
         orders = await get_pending_orders()
         if not orders:
-            await query.edit_message_text("No active orders.")
+            await query.edit_message_text("Нет активных заказов.")
             return
-        text = "📦 Orders:\n"
+        text = "📦 Заказы:\n"
         for o in orders:
             text += f"#{o['id']} | {o['status']} | {o['platform']} | {o['topic']}\n"
-        await query.edit_message_text(text)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(t['back'], callback_data="admin_back")]])
+        await query.edit_message_text(text, reply_markup=kb)
     elif data == "admin_deposits":
         reqs = await get_pending_balance_requests()
         if not reqs:
-            await query.edit_message_text("No deposit requests.")
+            await query.edit_message_text("Нет заявок на пополнение.")
             return
         for r in reqs:
             user_data = await get_user(r['user_id'])
             await context.bot.send_photo(
                 chat_id=ADMIN_ID,
                 photo=r['screenshot_file_id'],
-                caption=await get_text(ADMIN_ID, 'new_balance_req', r['id'], user_data['username'] or "N/A", r['user_id'], r['amount']),
+                caption=t['new_balance_req'].format(r['id'], user_data['username'] or "N/A", r['user_id'], r['amount']),
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(await get_text(ADMIN_ID, 'confirm'), callback_data=f"conf_deposit_{r['id']}"),
-                     InlineKeyboardButton(await get_text(ADMIN_ID, 'reject'), callback_data=f"rej_deposit_{r['id']}")]
+                    [InlineKeyboardButton(t['confirm'], callback_data=f"conf_deposit_{r['id']}"),
+                     InlineKeyboardButton(t['reject'], callback_data=f"rej_deposit_{r['id']}")]
                 ])
             )
-        await query.edit_message_text("Requests sent above.")
+        await query.edit_message_text("Заявки отправлены выше.")
     elif data == "admin_withdrawals":
         reqs = await get_pending_withdrawals()
         if not reqs:
-            await query.edit_message_text("No withdrawal requests.")
+            await query.edit_message_text("Нет заявок на вывод.")
             return
         for r in reqs:
             user_data = await get_user(r['user_id'])
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
-                text=await get_text(ADMIN_ID, 'new_withdrawal', r['id'], user_data['username'] or "N/A", r['user_id'], r['amount'], r['initials'], r['card_details']),
+                text=t['new_withdrawal'].format(r['id'], user_data['username'] or "N/A", r['user_id'], r['amount'], r['initials'], r['card_details']),
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(await get_text(ADMIN_ID, 'confirm'), callback_data=f"conf_withdraw_{r['id']}"),
-                     InlineKeyboardButton(await get_text(ADMIN_ID, 'reject'), callback_data=f"rej_withdraw_{r['id']}")]
+                    [InlineKeyboardButton(t['confirm'], callback_data=f"conf_withdraw_{r['id']}"),
+                     InlineKeyboardButton(t['reject'], callback_data=f"rej_withdraw_{r['id']}")]
                 ])
             )
-        await query.edit_message_text("Requests sent above.")
+        await query.edit_message_text("Заявки отправлены выше.")
     elif data.startswith("conf_deposit_"):
         req_id = int(data.split('_')[2])
         req = await get_balance_request(req_id)
         if not req or req['status'] != 'pending':
-            await query.edit_message_text("Already processed.")
+            await query.edit_message_text("Уже обработано.")
             return
         await update_balance_request(req_id, 'confirmed')
         await update_balance(req['user_id'], req['amount'])
-        await context.bot.send_message(req['user_id'], await get_text(req['user_id'], 'balance_confirmed', req['amount']))
-        await query.edit_message_text(f"✅ Deposit #{req_id} confirmed.")
+        await context.bot.send_message(req['user_id'], t['balance_confirmed'].format(req['amount']))
+        await query.edit_message_text(f"✅ Пополнение #{req_id} подтверждено.")
     elif data.startswith("rej_deposit_"):
         req_id = int(data.split('_')[2])
         req = await get_balance_request(req_id)
         await update_balance_request(req_id, 'rejected')
         if req:
-            await context.bot.send_message(req['user_id'], await get_text(req['user_id'], 'balance_rejected'))
-        await query.edit_message_text("❌ Rejected.")
+            await context.bot.send_message(req['user_id'], t['balance_rejected'])
+        await query.edit_message_text("❌ Отклонено.")
     elif data.startswith("conf_withdraw_"):
         req_id = int(data.split('_')[2])
         req = await get_withdrawal_request(req_id)
         if not req or req['status'] != 'pending':
-            await query.edit_message_text("Already processed.")
+            await query.edit_message_text("Уже обработано.")
             return
         await update_withdrawal(req_id, 'confirmed')
         await update_balance(req['user_id'], -req['amount'])
-        await context.bot.send_message(req['user_id'], await get_text(req['user_id'], 'withdrawal_confirmed'))
-        await query.edit_message_text(f"✅ Withdrawal #{req_id} confirmed.")
+        await context.bot.send_message(req['user_id'], t['withdrawal_confirmed'])
+        await query.edit_message_text(f"✅ Вывод #{req_id} подтвержден.")
     elif data.startswith("rej_withdraw_"):
         req_id = int(data.split('_')[2])
         req = await get_withdrawal_request(req_id)
         await update_withdrawal(req_id, 'rejected')
         if req:
-            await context.bot.send_message(req['user_id'], await get_text(req['user_id'], 'withdrawal_rejected'))
-        await query.edit_message_text("❌ Rejected.")
+            await context.bot.send_message(req['user_id'], t['withdrawal_rejected'])
+        await query.edit_message_text("❌ Отклонено.")
     elif data == "admin_staff":
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Assign developer", callback_data="staff_setdev")],
-            [InlineKeyboardButton("Remove developer", callback_data="staff_removedev")],
-            [InlineKeyboardButton("Ban", callback_data="staff_ban")],
-            [InlineKeyboardButton("Unban", callback_data="staff_unban")],
+            [InlineKeyboardButton(t['staff_setdev'], callback_data="staff_setdev")],
+            [InlineKeyboardButton(t['staff_removedev'], callback_data="staff_removedev")],
+            [InlineKeyboardButton(t['staff_ban'], callback_data="staff_ban")],
+            [InlineKeyboardButton(t['staff_unban'], callback_data="staff_unban")],
+            [InlineKeyboardButton(t['staff_back'], callback_data="admin_back")],
         ])
-        await query.edit_message_text("Staff management", reply_markup=kb)
+        await query.edit_message_text("Управление персоналом", reply_markup=kb)
     elif data.startswith("staff_"):
         action = data.split('_')[1]
         context.user_data['staff_action'] = action
         context.user_data['state'] = 'admin_staff'
-        await query.edit_message_text(await get_text(tg_id, 'enter_user_id'))
+        await query.edit_message_text(t['enter_user_id'])
+        await context.bot.send_message(chat_id=tg_id, text=t['enter_user_id'], reply_markup=await cancel_keyboard(tg_id))
     elif data == "admin_broadcast":
         context.user_data['state'] = 'admin_broadcast'
-        await query.edit_message_text(await get_text(tg_id, 'enter_broadcast'))
+        await query.edit_message_text(t['enter_broadcast'])
+        await context.bot.send_message(chat_id=tg_id, text=t['enter_broadcast'], reply_markup=await cancel_keyboard(tg_id))
     elif data == "admin_promos":
         context.user_data['state'] = 'admin_promo'
-        await query.edit_message_text(await get_text(tg_id, 'enter_promo'))
+        await query.edit_message_text(t['enter_promo'])
+        await context.bot.send_message(chat_id=tg_id, text=t['enter_promo'], reply_markup=await cancel_keyboard(tg_id))
+    elif data == "admin_back":
+        await query.edit_message_text("Назад.")
+        await context.bot.send_message(chat_id=tg_id, text=t['menu'], reply_markup=await main_menu_keyboard(tg_id))
     elif data.startswith("list_take_"):
         order_id = int(data.split('_')[2])
         order = await get_order(order_id)
         if not order or order['developer_id']:
-            await query.edit_message_text("Order already taken.")
+            await query.edit_message_text("Заказ уже взят.")
             return
-        # Check if dev has active order
         if user['role'] == 'developer':
             active = await get_orders_by_developer(tg_id)
             if active:
-                await query.edit_message_text(await get_text(tg_id, 'dev_max_orders'))
+                await query.edit_message_text(t['dev_max_orders'])
                 return
         await update_order(order_id, developer_id=tg_id, status='in_progress')
-        await query.edit_message_text(await get_text(tg_id, 'order_taken', order_id))
+        await query.edit_message_text(t['order_taken'].format(order_id))
         await context.bot.send_message(
             chat_id=order['user_id'],
-            text=f"🔔 Developer assigned to your order #{order_id}. Development started."
+            text=f"🔔 Разработчик назначен на ваш заказ #{order_id}. Разработка началась."
         )
     elif data.startswith("dev_extend_"):
         order_id = int(data.split('_')[2])
         order = await get_order(order_id)
         if not order or order['developer_id'] != tg_id:
-            await query.edit_message_text("Not your order.")
+            await query.edit_message_text("Не ваш заказ.")
             return
         new_days = (order['deadline_days'] or 0) + DEV_DEADLINE_EXTENSION
         await update_order(order_id, deadline_days=new_days)
-        await query.edit_message_text(await get_text(tg_id, 'deadline_extended', DEV_DEADLINE_EXTENSION, new_days))
+        await query.edit_message_text(t['deadline_extended'].format(DEV_DEADLINE_EXTENSION, new_days))
         await context.bot.send_message(
             chat_id=order['user_id'],
-            text=f"📅 Deadline for order #{order_id} extended by {DEV_DEADLINE_EXTENSION} days. New deadline: {new_days} days."
+            text=f"📅 Срок заказа #{order_id} продлен на {DEV_DEADLINE_EXTENSION} дней. Новый срок: {new_days} дней."
         )
     elif data.startswith("dev_cancelconfirm_"):
         order_id = int(data.split('_')[2])
         order = await get_order(order_id)
         if not order or order['developer_id'] != tg_id:
-            await query.edit_message_text("Not your order.")
+            await query.edit_message_text("Не ваш заказ.")
             return
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Yes, cancel", callback_data=f"dev_cancel_{order_id}")],
-            [InlineKeyboardButton("🔙 Back", callback_data=f"dev_back_{order_id}")]
+            [InlineKeyboardButton("✅ Да, отменить", callback_data=f"dev_cancel_{order_id}")],
+            [InlineKeyboardButton(t['back'], callback_data=f"dev_back_{order_id}")]
         ])
-        await query.edit_message_text(await get_text(tg_id, 'dev_cancel_confirm'), reply_markup=kb)
+        await query.edit_message_text(t['dev_cancel_confirm'], reply_markup=kb)
     elif data.startswith("dev_cancel_"):
         order_id = int(data.split('_')[2])
         order = await get_order(order_id)
         if not order or order['developer_id'] != tg_id:
-            await query.edit_message_text("Not your order.")
+            await query.edit_message_text("Не ваш заказ.")
             return
-        # Apply penalty
         penalty_amount = (order['price'] or 0) * (DEV_PENALTY_PERCENT / 100)
         await update_dev_penalty(tg_id, penalty_amount)
         await update_order(order_id, developer_id=None, status='price_set')
-        await query.edit_message_text(await get_text(tg_id, 'dev_cancelled'))
-        # Refund client if prepayment was made
+        await query.edit_message_text(t['dev_cancelled'])
         if order['price'] and order['price'] < PREPAYMENT_LIMIT:
             await update_balance(order['user_id'], order['price'])
             await context.bot.send_message(
                 chat_id=order['user_id'],
-                text=f"❌ Order #{order_id} cancelled by developer. Prepayment {order['price']} ₽ refunded to your balance."
+                text=f"❌ Заказ #{order_id} отменен разработчиком. Предоплата {order['price']} ₽ возвращена на баланс."
             )
         else:
             await context.bot.send_message(
                 chat_id=order['user_id'],
-                text=f"❌ Order #{order_id} cancelled by developer. No prepayment was required."
+                text=f"❌ Заказ #{order_id} отменен разработчиком. Предоплата не требовалась."
             )
     elif data.startswith("dev_back_"):
-        order_id = int(data.split('_')[2])
-        await query.edit_message_text("Cancelled.")
+        await query.edit_message_text("Отменено.")
     else:
-        await query.edit_message_text("Unknown command.")
+        await query.edit_message_text("Неизвестная команда.")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
@@ -1567,20 +1565,21 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = context.user_data['deposit_amount']
         req_id = await create_balance_request(tg_id, amount, photo_id)
         user_data = await get_user(tg_id)
+        lang = await get_user_lang(tg_id)
+        t = TEXTS[lang]
         await context.bot.send_photo(
             chat_id=ADMIN_ID,
             photo=photo_id,
-            caption=await get_text(ADMIN_ID, 'new_balance_req', req_id, user_data['username'] or "N/A", tg_id, amount),
+            caption=t['new_balance_req'].format(req_id, user_data['username'] or "N/A", tg_id, amount),
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(await get_text(ADMIN_ID, 'confirm'), callback_data=f"conf_deposit_{req_id}"),
-                 InlineKeyboardButton(await get_text(ADMIN_ID, 'reject'), callback_data=f"rej_deposit_{req_id}")]
+                [InlineKeyboardButton(t['confirm'], callback_data=f"conf_deposit_{req_id}"),
+                 InlineKeyboardButton(t['reject'], callback_data=f"rej_deposit_{req_id}")]
             ])
         )
-        context.user_data.pop('state', None)
-        context.user_data.pop('deposit_amount', None)
-        await update.message.reply_text(await get_text(tg_id, 'deposit_sent'), reply_markup=await main_menu_keyboard(tg_id))
+        clear_state(context)
+        await update.message.reply_text(t['deposit_sent'], reply_markup=await main_menu_keyboard(tg_id))
     else:
-        await update.message.reply_text("Photo not expected.")
+        await update.message.reply_text("Фото не ожидалось.")
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
@@ -1589,10 +1588,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = context.user_data['zip_order_id']
         order = await get_order(order_id)
         file_id = update.message.document.file_id
+        lang = await get_user_lang(order['user_id'])
+        t = TEXTS[lang]
         await context.bot.send_document(
             chat_id=order['user_id'],
             document=file_id,
-            caption=await get_text(order['user_id'], 'zip_sent')
+            caption=t['zip_sent']
         )
         await update_order(order_id, status='delivered')
         kb = InlineKeyboardMarkup([
@@ -1604,19 +1605,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
         await context.bot.send_message(
             chat_id=order['user_id'],
-            text=await get_text(order['user_id'], 'leave_review'),
+            text=t['leave_review'],
             reply_markup=kb
         )
-        context.user_data.pop('state', None)
-        context.user_data.pop('zip_order_id', None)
-        await update.message.reply_text("ZIP sent to client.")
+        clear_state(context)
+        await update.message.reply_text("ZIP отправлен клиенту.", reply_markup=await main_menu_keyboard(tg_id))
     else:
-        await update.message.reply_text("Document not expected.")
+        await update.message.reply_text("Документ не ожидалось.")
 
 
 # ==================== MAIN ====================
 async def post_init(application: Application):
-    """Initialize DB after application is built"""
     await init_db()
 
 def main():
@@ -1627,22 +1626,18 @@ def main():
         .build()
     )
 
-    # Commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", cmd_admin))
     application.add_handler(CommandHandler("dev", cmd_dev))
     application.add_handler(CommandHandler("list", cmd_list))
 
-    # Callbacks
     application.add_handler(CallbackQueryHandler(set_language_callback, pattern="^lang_"))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ZIP, handle_document))
 
-    # Run polling (blocking, synchronous)
     application.run_polling()
 
 if __name__ == "__main__":
