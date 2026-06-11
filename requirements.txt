@@ -1,2 +1,7 @@
-python-telegram-bot
-aiosqlite
+aiogram==3.3.0
+sqlalchemy==2.0.23
+python-dotenv==1.0.0
+aiohttp==3.9.1
+pydantic==2.5.0
+psycopg2-binary==2.9.9
+pytz==2023.3

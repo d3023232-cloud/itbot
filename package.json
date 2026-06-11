@@ -1,0 +1,20 @@
+{
+  "name": "IT-Market-Bot",
+  "description": "Professional Telegram platform for bot development orders",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "python3 app.py",
+    "setup": "python3 setup.py",
+    "install": "pip install -r requirements.txt"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "marketplace",
+    "orders",
+    "development"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
+}

@@ -1,0 +1,12 @@
+runtime: python310
+
+entrypoint: gunicorn -b 0.0.0.0:8080 app:app
+
+env: standard
+
+env_variables:
+  PYTHONUNBUFFERED: "true"
+
+handlers:
+- url: .*
+  script: auto
