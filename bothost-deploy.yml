@@ -1,63 +1,27 @@
-# BotHost Deployment Configuration
-# ================================
-
+# BotHost Configuration - Python Only
 version: "1.0"
 
-# Application Metadata
 app:
   name: "IT Market Bot"
-  description: "Professional Telegram platform for managing bot development orders"
-  version: "1.0.0"
+  description: "Professional Telegram platform for bot development orders"
+  language: "python"
+  runtime: "3.12"
   
-# Runtime Configuration
-runtime:
-  python: "3.10"
-  nodejs: null
+env_variables:
+  - BOT_TOKEN         # Required
+  - ADMIN_IDS         # Required
+  - DATABASE_URL      # Required
+  - USE_WEBHOOK       # Optional: true/false
+  - WEBHOOK_URL       # Optional
   
-# Entry Points
-entry_points:
-  main: "app.py"  # Main bot process
-  web: "app.py"   # HTTP server for webhooks
-  
-# Scripts to run during deployment
 scripts:
-  install: "python3 -m pip install -r requirements.txt"
+  install: "pip install -r requirements.txt"
   start: "python3 app.py"
-  setup: "python3 setup.py"
   
-# Required Environment Variables
-env_vars:
-  - BOT_TOKEN         # Telegram Bot Token from @BotFather
-  - ADMIN_IDS         # Comma-separated admin Telegram IDs
-  - DATABASE_URL      # PostgreSQL connection string
-  - USE_WEBHOOK       # true/false for webhook/polling mode
-  - WEBHOOK_URL       # Your webhook URL (if using webhook mode)
-  
-# Optional Environment Variables
-env_vars_optional:
-  - PAYMENT_API_KEY   # For future payment integration
-  - LOG_LEVEL         # DEBUG, INFO, WARNING, ERROR
-  
-# Health Check
 health_check:
   enabled: true
-  path: "/health"
   interval: 30
-  timeout: 5
   
-# Build Configuration
-build:
-  auto_install: true
-  install_command: "pip install -r requirements.txt"
-  
-# Performance
 resources:
   memory: "512MB"
   cpu: "0.5"
-  
-# Webhook Configuration
-webhook:
-  enabled: true
-  path: "/webhook"
-  port: 8080
-  auto_ssl: true

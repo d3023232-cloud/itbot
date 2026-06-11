@@ -1,13 +1,6 @@
 runtime: python312
-
 env: standard
-
-install_dependencies: true
-
-entrypoint: python3 start.py
-
+entrypoint: "exec python3 app.py"
 env_variables:
   PYTHONUNBUFFERED: "true"
   PYTHONDONTWRITEBYTECODE: "true"
-
-auto_env_variables: true

@@ -2,13 +2,16 @@ version: '3.8'
 
 services:
   bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: it_market_bot
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
       - ADMIN_IDS=${ADMIN_IDS}
       - DATABASE_URL=postgresql+psycopg2://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
       - USE_WEBHOOK=false
+      - PYTHONUNBUFFERED=1
     depends_on:
       postgres:
         condition: service_healthy

@@ -1,0 +1,51 @@
+*.pyc
+__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Package files (NO Node.js)
+# package.json - REMOVED (Python only)
+# package-lock.json - REMOVED (Python only)
+# node_modules/ - REMOVED (Python only)
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Docker
+.dockerignore
+.docker/
+
+# Temporary
+*.tmp
+*.temp
+.cache/
