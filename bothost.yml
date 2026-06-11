@@ -1,0 +1,27 @@
+# BotHost Configuration
+version: "1.0"
+
+app:
+  name: "IT Market Bot"
+  description: "Professional platform for bot development orders"
+  
+runtime:
+  python: "3.10"
+  
+entry_point: "app.py"
+
+environment:
+  - BOT_TOKEN  # Required: Telegram Bot Token from @BotFather
+  - ADMIN_IDS  # Required: Comma-separated admin Telegram IDs
+  - DATABASE_URL  # Required: PostgreSQL connection string
+  - USE_WEBHOOK  # Optional: true for webhook, false for polling
+  - WEBHOOK_URL  # Optional: Your webhook URL for production
+
+scripts:
+  start: "python3 app.py"
+  install: "pip install -r requirements.txt"
+  
+features:
+  - telegram_bot
+  - database_postgresql
+  - webhook_support
