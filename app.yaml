@@ -1,12 +1,13 @@
-runtime: python310
-
-entrypoint: gunicorn -b 0.0.0.0:8080 app:app
+runtime: python312
 
 env: standard
 
+install_dependencies: true
+
+entrypoint: python3 start.py
+
 env_variables:
   PYTHONUNBUFFERED: "true"
+  PYTHONDONTWRITEBYTECODE: "true"
 
-handlers:
-- url: .*
-  script: auto
+auto_env_variables: true
